@@ -468,7 +468,7 @@ export async function requestDeviceCode({
   return {
     deviceCode: stringField(value, 'device_code'),
     expiresIn: numberField(value, 'expires_in'),
-    interval: numberField(value, 'interval'),
+    interval: value.interval === undefined ? 5 : numberField(value, 'interval'),
     userCode: stringField(value, 'user_code'),
     verificationUri: stringField(value, 'verification_uri'),
     verificationUriComplete: optionalStringField(
@@ -496,17 +496,31 @@ export async function pollDeviceToken({
   let intervalSeconds = deviceCode.interval;
 
   while (now() < deadline) {
-    await sleep(intervalSeconds * 1000);
-    const response = await fetchImplementation(`${authBaseUrl}/oauth2/token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: DEVICE_CODE_GRANT_TYPE,
-        client_id: OAUTH_CLIENT_ID,
-        device_code: deviceCode.deviceCode,
-        resource: apiResource,
-      }),
-    });
+    await sleep(Math.min(intervalSeconds * 1000, deadline - now()));
+    const remainingMs = deadline - now();
+    if (remainingMs <= 0) break;
+    let response: Response;
+    try {
+      response = await fetchImplementation(`${authBaseUrl}/oauth2/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: DEVICE_CODE_GRANT_TYPE,
+          client_id: OAUTH_CLIENT_ID,
+          device_code: deviceCode.deviceCode,
+          resource: apiResource,
+        }),
+        signal: AbortSignal.timeout(remainingMs),
+      });
+    } catch {
+      intervalSeconds += SLOW_DOWN_INCREMENT_SECONDS;
+      continue;
+    }
+    if (response.status >= 500) {
+      await response.body?.cancel();
+      intervalSeconds += SLOW_DOWN_INCREMENT_SECONDS;
+      continue;
+    }
     const value = await readJson(response);
     if (response.ok) return parseTokens(value, undefined, now());
 
@@ -568,6 +582,11 @@ export async function login(options: LoginOptions = {}): Promise<OAuthTokens> {
   const authBaseUrl = options.authBaseUrl ?? getAuthBaseUrl();
   const apiResource = options.apiResource ?? getApiResource();
   if (options.noBrowser) {
+    if (!options.onDeviceCode) {
+      throw new Error(
+        'Sign in with --no-browser needs an onDeviceCode handler to show the user code'
+      );
+    }
     return loginWithDeviceCode(options, authBaseUrl, apiResource);
   }
   let loopback: Awaited<ReturnType<typeof startLoopbackServer>>;

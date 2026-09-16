@@ -573,6 +573,20 @@ describe('login', () => {
     );
   });
 
+  it('rejects --no-browser without an onDeviceCode handler before requesting a code', async () => {
+    const fetchImplementation = vi.fn<typeof fetch>();
+
+    await expect(
+      login({
+        authBaseUrl,
+        apiResource,
+        fetch: fetchImplementation,
+        noBrowser: true,
+      })
+    ).rejects.toThrow('needs an onDeviceCode handler');
+    expect(fetchImplementation).not.toHaveBeenCalled();
+  });
+
   it('signs in over a corrupt credentials file and keeps a backup', async () => {
     vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
     await writeOAuthTokens(tokens, authBaseUrl);
@@ -613,6 +627,64 @@ describe('device authorization grant', () => {
     ).rejects.toThrow('does not recognize the gt CLI');
   });
 
+  it('defaults a missing interval to five seconds', async () => {
+    const response = deviceCodeResponse();
+    delete response.interval;
+    const fetchImplementation = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(response))
+      .mockResolvedValueOnce(
+        jsonResponse(tokenResponse('access-2', 'refresh-2'))
+      );
+    const sleep = vi.fn(async (_milliseconds: number) => undefined);
+
+    const requested = await requestDeviceCode({
+      authBaseUrl,
+      apiResource,
+      fetch: fetchImplementation,
+    });
+    await pollDeviceToken({
+      authBaseUrl,
+      apiResource,
+      deviceCode: requested,
+      fetch: fetchImplementation,
+      sleep,
+    });
+
+    expect(requested.interval).toBe(5);
+    expect(sleep.mock.calls.map(([ms]) => ms)).toEqual([5_000]);
+  });
+
+  it('keeps polling through a rejected fetch and a 5xx response', async () => {
+    const fetchImplementation = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(new Error('socket hang up'))
+      .mockResolvedValueOnce(
+        new Response('<html>Service Unavailable</html>', { status: 503 })
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(tokenResponse('access-2', 'refresh-2'))
+      );
+    let clock = 0;
+    const sleep = vi.fn(async (ms: number) => {
+      clock += ms;
+    });
+
+    const result = await pollDeviceToken({
+      authBaseUrl,
+      apiResource,
+      deviceCode,
+      fetch: fetchImplementation,
+      now: () => clock,
+      sleep,
+    });
+
+    expect(result.accessToken).toBe('access-2');
+    expect(sleep.mock.calls.map(([ms]) => ms)).toEqual([5_000, 10_000, 15_000]);
+    const init = fetchImplementation.mock.calls[2][1];
+    expect(init?.signal).toBeInstanceOf(AbortSignal);
+  });
+
   it('backs off on slow_down and stops on a terminal error', async () => {
     const fetchImplementation = vi
       .fn<typeof fetch>()
@@ -634,22 +706,25 @@ describe('device authorization grant', () => {
 
   it('gives up once the code expires', async () => {
     let clock = 0;
+    const requestedAt: number[] = [];
+    const sleep = vi.fn(async (ms: number) => {
+      clock += ms;
+    });
     await expect(
       pollDeviceToken({
         authBaseUrl,
         apiResource,
         deviceCode: { ...deviceCode, expiresIn: 12 },
-        fetch: vi
-          .fn<typeof fetch>()
-          .mockImplementation(async () =>
-            jsonResponse({ error: 'authorization_pending' }, 400)
-          ),
+        fetch: vi.fn<typeof fetch>().mockImplementation(async () => {
+          requestedAt.push(clock);
+          return jsonResponse({ error: 'authorization_pending' }, 400);
+        }),
         now: () => clock,
-        sleep: async (ms) => {
-          clock += ms;
-        },
+        sleep,
       })
     ).rejects.toThrow('expired before it was approved');
+    expect(sleep.mock.calls.map(([ms]) => ms)).toEqual([5_000, 5_000, 2_000]);
+    expect(requestedAt).toEqual([5_000, 10_000]);
   });
 });
 
