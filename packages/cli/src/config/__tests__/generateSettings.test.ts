@@ -5,6 +5,8 @@ import { determineLibrary } from '../../fs/determineFramework/index.js';
 import { logger } from '../../console/logger.js';
 import { resolveConfig } from '../resolveConfig.js';
 import { getValidAccessToken, refreshOAuthTokens } from '../../auth/oauth.js';
+import { configureApiClient } from '../../utils/api.js';
+import { gt } from '../../utils/gt.js';
 
 // Mock resolveFiles
 vi.mock('../../fs/config/parseFilesConfig', () => ({
@@ -65,6 +67,10 @@ vi.mock('../../utils/gt.js', () => ({
   gt: {
     setConfig: vi.fn(),
   },
+}));
+
+vi.mock('../../utils/api.js', () => ({
+  configureApiClient: vi.fn(),
 }));
 
 vi.mock('../../auth/oauth.js', () => ({
@@ -379,8 +385,10 @@ describe('generateSettings - composite patterns', () => {
     );
   });
 
-  it('configures a refreshable user token only when no explicit API key exists', async () => {
-    vi.mocked(getValidAccessToken).mockResolvedValue('user-access-token');
+  it('configures a lazy user token provider only when no explicit API key exists', async () => {
+    vi.mocked(getValidAccessToken).mockRejectedValue(
+      new Error('Stored OAuth credentials are invalid')
+    );
     vi.mocked(refreshOAuthTokens).mockResolvedValue({
       accessToken: 'refreshed-token',
       expiresAt: Date.now() + 3_600_000,
@@ -395,16 +403,32 @@ describe('generateSettings - composite patterns', () => {
       '/test/cwd'
     );
 
+    expect(getValidAccessToken).not.toHaveBeenCalled();
     expect(userSettings.apiKey).toBeUndefined();
-    expect(await userSettings.userTokenProvider?.getAccessToken()).toBe(
-      'user-access-token'
-    );
-    expect(await userSettings.userTokenProvider?.refreshAccessToken()).toBe(
-      'refreshed-token'
-    );
+    expect(userSettings.userTokenProvider).toBeDefined();
+    expect(vi.mocked(configureApiClient).mock.calls[0][0]).toMatchObject({
+      userTokenProvider: userSettings.userTokenProvider,
+    });
+    expect(vi.mocked(gt.setConfig).mock.calls[0][0]).toMatchObject({
+      userTokenProvider: userSettings.userTokenProvider,
+    });
     expect(keySettings.apiKey).toBe('explicit-api-key');
     expect(keySettings.userTokenProvider).toBeUndefined();
-    expect(getValidAccessToken).toHaveBeenCalledTimes(2);
+
+    await expect(
+      userSettings.userTokenProvider!.getAccessToken()
+    ).rejects.toThrow('Stored OAuth credentials are invalid');
+    vi.mocked(getValidAccessToken).mockResolvedValue(undefined);
+    await expect(
+      userSettings.userTokenProvider!.getAccessToken()
+    ).rejects.toThrow('Run `gt login` to sign in');
+    vi.mocked(getValidAccessToken).mockResolvedValue('user-access-token');
+    await expect(
+      userSettings.userTokenProvider!.getAccessToken()
+    ).resolves.toBe('user-access-token');
+    await expect(
+      userSettings.userTokenProvider!.refreshAccessToken()
+    ).resolves.toBe('refreshed-token');
   });
 
   it('should not call resolveFiles when files are not provided', async () => {

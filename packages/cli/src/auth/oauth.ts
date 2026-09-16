@@ -12,6 +12,7 @@ import path from 'node:path';
 import open from 'open';
 import { defaultBaseUrl } from 'generaltranslation/internal';
 import { GT_DASHBOARD_URL } from '../utils/constants.js';
+import { logger } from '../console/logger.js';
 import {
   parseAuthorizationCallback,
   startLoopbackServer,
@@ -229,10 +230,17 @@ export function getCredentialsPath(): string {
 // Credentials file
 // ---------------------------------------------------------------------------
 
-async function readCredentialsFile(): Promise<StoredCredentials> {
+const CORRUPT_CREDENTIALS_RESET =
+  'Stored OAuth credentials were invalid and have been reset.';
+
+/** Fails closed unless `corruptWarning` is given, which sets an unreadable file aside instead. */
+async function readCredentialsFile(
+  corruptWarning?: string
+): Promise<StoredCredentials> {
+  const credentialsPath = getCredentialsPath();
   let contents: string;
   try {
-    contents = await readFile(getCredentialsPath(), 'utf8');
+    contents = await readFile(credentialsPath, 'utf8');
   } catch (error) {
     if (isRecord(error) && error.code === 'ENOENT') {
       return { version: 2, servers: {} };
@@ -272,6 +280,14 @@ async function readCredentialsFile(): Promise<StoredCredentials> {
     }
     return { version: 2, servers };
   } catch (error) {
+    if (corruptWarning) {
+      const backupPath = `${credentialsPath}.corrupt-${Date.now()}`;
+      await rename(credentialsPath, backupPath);
+      logger.warn(
+        `${corruptWarning} The unreadable file was moved to ${backupPath}`
+      );
+      return { version: 2, servers: {} };
+    }
     const detail = error instanceof Error ? error.message : 'unknown error';
     throw new Error(`Stored OAuth credentials are invalid: ${detail}`, {
       cause: error,
@@ -307,7 +323,7 @@ async function updateServerCredentials(
   authBaseUrl: string,
   update: (current: StoredServerCredentials) => StoredServerCredentials | null
 ): Promise<void> {
-  const credentials = await readCredentialsFile();
+  const credentials = await readCredentialsFile(CORRUPT_CREDENTIALS_RESET);
   const next = update(credentials.servers[authBaseUrl] ?? {});
   if (next === null || (!next.client && !next.tokens)) {
     delete credentials.servers[authBaseUrl];
@@ -433,10 +449,11 @@ export async function registerOAuthClient({
 async function getOrRegisterOAuthClient(
   options: OAuthRequestOptions
 ): Promise<OAuthClient> {
-  return (
-    (await readOAuthClient(options.authBaseUrl)) ??
-    (await registerOAuthClient(options))
-  );
+  const stored = (await readCredentialsFile(CORRUPT_CREDENTIALS_RESET)).servers[
+    options.authBaseUrl ?? getAuthBaseUrl()
+  ]?.client;
+  if (!stored) return registerOAuthClient(options);
+  return { clientId: stored.client_id, redirectUri: stored.redirect_uri };
 }
 
 // ---------------------------------------------------------------------------
@@ -615,10 +632,27 @@ export async function login(options: LoginOptions = {}): Promise<OAuthTokens> {
 // Refresh / logout / userinfo
 // ---------------------------------------------------------------------------
 
+const pendingRefreshes = new Map<string, Promise<OAuthTokens>>();
+
 export async function refreshOAuthTokens({
   authBaseUrl = getAuthBaseUrl(),
   fetch: fetchImplementation = globalThis.fetch,
 }: OAuthRequestOptions = {}): Promise<OAuthTokens> {
+  const pending = pendingRefreshes.get(authBaseUrl);
+  if (pending) return pending;
+  const refresh = exchangeRefreshToken(authBaseUrl, fetchImplementation);
+  pendingRefreshes.set(authBaseUrl, refresh);
+  try {
+    return await refresh;
+  } finally {
+    pendingRefreshes.delete(authBaseUrl);
+  }
+}
+
+async function exchangeRefreshToken(
+  authBaseUrl: string,
+  fetchImplementation: typeof fetch
+): Promise<OAuthTokens> {
   const current = await readOAuthTokens(authBaseUrl);
   const client = await readOAuthClient(authBaseUrl);
   if (!current?.refreshToken || !client) {
@@ -658,16 +692,21 @@ export async function logout({
   authBaseUrl = getAuthBaseUrl(),
   fetch: fetchImplementation = globalThis.fetch,
 }: OAuthRequestOptions = {}): Promise<void> {
-  const tokens = await readOAuthTokens(authBaseUrl);
-  const client = await readOAuthClient(authBaseUrl);
+  const stored = (
+    await readCredentialsFile(
+      'Stored OAuth credentials were invalid, so the session could not be revoked remotely.'
+    )
+  ).servers[authBaseUrl];
+  const tokens = stored?.tokens;
+  const client = stored?.client;
   try {
-    if (tokens?.refreshToken && client) {
+    if (tokens?.refresh_token && client) {
       await fetchImplementation(`${authBaseUrl}/oauth2/revoke`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({
-          client_id: client.clientId,
-          token: tokens.refreshToken,
+          client_id: client.client_id,
+          token: tokens.refresh_token,
           token_type_hint: 'refresh_token',
         }),
       });

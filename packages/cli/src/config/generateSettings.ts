@@ -209,9 +209,13 @@ export async function generateSettings(
 
   // Explicit keys remain the highest-precedence credential for automation.
   mergedOptions.apiKey = mergedOptions.apiKey || process.env.GT_API_KEY;
-  if (!mergedOptions.apiKey && (await getValidAccessToken())) {
+  if (!mergedOptions.apiKey) {
     mergedOptions.userTokenProvider = {
-      getAccessToken: getValidAccessToken,
+      getAccessToken: async () => {
+        const accessToken = await getValidAccessToken();
+        if (!accessToken) throw new Error('Run `gt login` to sign in');
+        return accessToken;
+      },
       refreshAccessToken: async () => (await refreshOAuthTokens()).accessToken,
     };
   }
@@ -435,6 +439,7 @@ export async function generateSettings(
   configureApiClient({
     projectId: mergedOptions.projectId,
     apiKey: mergedOptions.apiKey,
+    userTokenProvider: mergedOptions.userTokenProvider,
     baseUrl: mergedOptions.baseUrl,
     customMapping: mergedOptions.customMapping,
   });

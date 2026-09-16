@@ -1,7 +1,16 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { logger } from '../console/logger.js';
 import {
   buildAuthorizationUrl,
   createPkcePair,
@@ -67,6 +76,12 @@ function formBody(call: unknown[] | undefined): URLSearchParams {
   return new URLSearchParams(String(init?.body));
 }
 
+async function corruptBackups(): Promise<string[]> {
+  return (await readdir(path.dirname(getCredentialsPath()))).filter((name) =>
+    name.startsWith('credentials.json.corrupt-')
+  );
+}
+
 let configHome: string;
 
 beforeEach(async () => {
@@ -75,6 +90,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await rm(configHome, { recursive: true, force: true });
   delete process.env.XDG_CONFIG_HOME;
   delete process.env.GT_API_URL;
@@ -152,6 +168,38 @@ describe('OAuth credential storage', () => {
     await expect(readOAuthTokens(authBaseUrl)).rejects.toThrow(
       'Stored OAuth credentials are invalid'
     );
+    expect(await corruptBackups()).toEqual([]);
+  });
+
+  it('sets a malformed file aside when replacing credentials', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    await writeOAuthTokens(tokens, authBaseUrl);
+    await writeFile(getCredentialsPath(), '{not json', 'utf8');
+
+    await writeOAuthTokens({ ...tokens, accessToken: 'access-2' }, authBaseUrl);
+
+    expect((await readOAuthTokens(authBaseUrl))?.accessToken).toBe('access-2');
+    const [backup] = await corruptBackups();
+    expect(backup).toBeDefined();
+    expect(
+      await readFile(
+        path.join(path.dirname(getCredentialsPath()), backup),
+        'utf8'
+      )
+    ).toBe('{not json');
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain(backup);
+  });
+
+  it('still propagates filesystem errors when replacing credentials', async () => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) return;
+    await writeOAuthTokens(tokens, authBaseUrl);
+    await chmod(getCredentialsPath(), 0o000);
+
+    await expect(writeOAuthTokens(tokens, authBaseUrl)).rejects.toThrow(
+      /EACCES|EPERM/
+    );
+    expect(await corruptBackups()).toEqual([]);
   });
 
   it('rejects the retired version 1 layout', async () => {
@@ -519,6 +567,29 @@ describe('login', () => {
     ).toBe('bare-code');
   });
 
+  it('signs in over a corrupt credentials file and keeps a backup', async () => {
+    vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    await writeOAuthClient(client, authBaseUrl);
+    await writeFile(getCredentialsPath(), '{not json', 'utf8');
+    const fetchImplementation = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({ client_id: 'client-new' }, 201))
+      .mockResolvedValueOnce(
+        jsonResponse(tokenResponse('access-2', 'refresh-2'))
+      );
+
+    await login({
+      authBaseUrl,
+      apiResource,
+      fetch: fetchImplementation,
+      noBrowser: true,
+      promptForCallback: async () => 'bare-code',
+    });
+
+    expect((await readOAuthTokens(authBaseUrl))?.accessToken).toBe('access-2');
+    expect(await corruptBackups()).toHaveLength(1);
+  });
+
   it('fails clearly when headless and no paste handler is provided', async () => {
     await writeOAuthClient(client, authBaseUrl);
     await expect(
@@ -552,18 +623,43 @@ describe('OAuth session operations', () => {
 
   it('persists refresh-token rotation before returning the new access token', async () => {
     await writeOAuthTokens({ ...tokens, expiresAt: 0 }, authBaseUrl);
+    let releaseRefresh!: (response: Response) => void;
     const fetchImplementation = vi
       .fn<typeof fetch>()
-      .mockResolvedValue(jsonResponse(tokenResponse('access-2', 'refresh-2')));
+      .mockResolvedValueOnce(new Response(null, { status: 401 }))
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          releaseRefresh = resolve;
+        })
+      );
 
     await expect(
-      getValidAccessToken({ authBaseUrl, fetch: fetchImplementation })
-    ).resolves.toBe('access-2');
+      refreshOAuthTokens({ authBaseUrl, fetch: fetchImplementation })
+    ).rejects.toThrow('Your login expired');
+
+    const concurrent = Promise.all([
+      getValidAccessToken({ authBaseUrl, fetch: fetchImplementation }),
+      refreshOAuthTokens({ authBaseUrl, fetch: fetchImplementation }),
+      getValidAccessToken({ authBaseUrl, fetch: fetchImplementation }),
+    ]);
+    await vi.waitFor(() =>
+      expect(fetchImplementation).toHaveBeenCalledTimes(2)
+    );
+    expect((await readOAuthTokens(authBaseUrl))?.refreshToken).toBe(
+      'refresh-1'
+    );
+    releaseRefresh(jsonResponse(tokenResponse('access-2', 'refresh-2')));
+    const [first, refreshed, second] = await concurrent;
+
+    expect(first).toBe('access-2');
+    expect(second).toBe('access-2');
+    expect(refreshed.accessToken).toBe('access-2');
+    expect(fetchImplementation).toHaveBeenCalledTimes(2);
     expect((await readOAuthTokens(authBaseUrl))?.refreshToken).toBe(
       'refresh-2'
     );
     expect(
-      Object.fromEntries(formBody(fetchImplementation.mock.calls[0]))
+      Object.fromEntries(formBody(fetchImplementation.mock.calls[1]))
     ).toEqual({
       client_id: client.clientId,
       grant_type: 'refresh_token',
@@ -617,6 +713,19 @@ describe('OAuth session operations', () => {
       token: 'refresh-1',
       token_type_hint: 'refresh_token',
     });
+  });
+
+  it('signs out locally without revoking when the credentials file is corrupt', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    await writeFile(getCredentialsPath(), '{not json', 'utf8');
+    const fetchImplementation = vi.fn<typeof fetch>();
+
+    await logout({ authBaseUrl, fetch: fetchImplementation });
+
+    expect(fetchImplementation).not.toHaveBeenCalled();
+    expect(await readOAuthTokens(authBaseUrl)).toBeUndefined();
+    expect(await corruptBackups()).toHaveLength(1);
+    expect(warn.mock.calls[0][0]).toContain('could not be revoked remotely');
   });
 
   it('refreshes and returns userinfo for whoami', async () => {
