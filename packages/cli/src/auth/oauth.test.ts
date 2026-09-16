@@ -24,10 +24,12 @@ import {
   logout,
   OAUTH_CLIENT_ID,
   OAUTH_SCOPE,
-  parsePastedCallback,
+  pollDeviceToken,
   readOAuthTokens,
   refreshOAuthTokens,
+  requestDeviceCode,
   whoAmI,
+  type DeviceCode,
   writeOAuthTokens,
   type OAuthTokens,
 } from './oauth.js';
@@ -43,7 +45,25 @@ const tokens: OAuthTokens = {
   tokenType: 'Bearer',
 };
 
-const registeredRedirectUri = 'http://127.0.0.1/callback';
+const deviceCode: DeviceCode = {
+  deviceCode: 'device-1',
+  expiresIn: 900,
+  interval: 5,
+  userCode: 'ABCD-EFGH',
+  verificationUri: 'https://dash.example/device',
+  verificationUriComplete: 'https://dash.example/device?user_code=ABCD-EFGH',
+};
+
+function deviceCodeResponse(): Record<string, unknown> {
+  return {
+    device_code: deviceCode.deviceCode,
+    user_code: deviceCode.userCode,
+    verification_uri: deviceCode.verificationUri,
+    verification_uri_complete: deviceCode.verificationUriComplete,
+    expires_in: deviceCode.expiresIn,
+    interval: deviceCode.interval,
+  };
+}
 
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
@@ -146,7 +166,7 @@ describe('OAuth credential storage', () => {
     const stored = JSON.parse(await readFile(getCredentialsPath(), 'utf8'));
     stored.servers[authBaseUrl].client = {
       client_id: 'client-1',
-      redirect_uri: registeredRedirectUri,
+      redirect_uri: 'http://127.0.0.1/callback',
     };
     await writeFile(getCredentialsPath(), JSON.stringify(stored), 'utf8');
 
@@ -334,18 +354,6 @@ describe('authorization code exchange', () => {
   });
 });
 
-describe('parsePastedCallback', () => {
-  it('accepts a full redirect URL', () => {
-    expect(
-      parsePastedCallback(' http://127.0.0.1/callback?code=c&state=s ')
-    ).toMatchObject({ code: 'c', state: 's' });
-  });
-
-  it('accepts a bare code', () => {
-    expect(parsePastedCallback('raw-code')).toEqual({ code: 'raw-code' });
-  });
-});
-
 describe('login', () => {
   it('opens the browser as the seeded client, receives the loopback callback, and stores tokens', async () => {
     const fetchImplementation = vi
@@ -487,61 +495,82 @@ describe('login', () => {
     ).rejects.toThrow('Timed out waiting for the browser to sign in');
   });
 
-  it('falls back to a pasted redirect URL with --no-browser and the registered redirect', async () => {
+  it('uses the device grant with --no-browser and stores the polled tokens', async () => {
     const fetchImplementation = vi
       .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(deviceCodeResponse()))
+      .mockResolvedValueOnce(
+        jsonResponse({ error: 'authorization_pending' }, 400)
+      )
       .mockResolvedValueOnce(
         jsonResponse(tokenResponse('access-2', 'refresh-2'))
       );
     const openBrowser = vi.fn();
-    let authorizationUrl = '';
+    const onDeviceCode = vi.fn();
+    const sleep = vi.fn(async () => undefined);
 
-    await login({
+    const result = await login({
       authBaseUrl,
       apiResource,
       fetch: fetchImplementation,
       noBrowser: true,
       openBrowser,
-      onAuthorizationUrl: (url) => {
-        authorizationUrl = url;
-      },
-      promptForCallback: async () => {
-        const state = new URL(authorizationUrl).searchParams.get('state')!;
-        return `http://127.0.0.1/callback?code=pasted&state=${state}`;
-      },
+      onDeviceCode,
+      sleep,
     });
 
+    expect(result.accessToken).toBe('access-2');
+    expect((await readOAuthTokens(authBaseUrl))?.refreshToken).toBe(
+      'refresh-2'
+    );
     expect(openBrowser).not.toHaveBeenCalled();
-    expect(new URL(authorizationUrl).searchParams.get('redirect_uri')).toBe(
-      registeredRedirectUri
+    expect(onDeviceCode).toHaveBeenCalledWith(deviceCode);
+    expect(fetchImplementation.mock.calls[0][0]).toBe(
+      `${authBaseUrl}/device/code`
     );
-    const exchange = Object.fromEntries(
-      formBody(fetchImplementation.mock.calls[0])
-    );
-    expect(exchange).toMatchObject({
-      code: 'pasted',
-      redirect_uri: registeredRedirectUri,
+    expect(
+      Object.fromEntries(formBody(fetchImplementation.mock.calls[0]))
+    ).toEqual({
+      client_id: OAUTH_CLIENT_ID,
+      scope: OAUTH_SCOPE,
+      resource: apiResource,
     });
+    expect(
+      Object.fromEntries(formBody(fetchImplementation.mock.calls[2]))
+    ).toEqual({
+      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+      client_id: OAUTH_CLIENT_ID,
+      device_code: 'device-1',
+      resource: apiResource,
+    });
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledWith(5_000);
   });
 
-  it('accepts a bare pasted code without a state', async () => {
+  it('opens the verification URL when a browser is available but the loopback listener cannot bind', async () => {
+    const loopback = await import('./loopback.js');
+    vi.spyOn(loopback, 'startLoopbackServer').mockRejectedValueOnce(
+      new Error('EADDRINUSE')
+    );
     const fetchImplementation = vi
       .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(deviceCodeResponse()))
       .mockResolvedValueOnce(
         jsonResponse(tokenResponse('access-2', 'refresh-2'))
       );
+    const openBrowser = vi.fn().mockResolvedValue(undefined);
 
     await login({
       authBaseUrl,
       apiResource,
       fetch: fetchImplementation,
-      noBrowser: true,
-      promptForCallback: async () => 'bare-code',
+      openBrowser,
+      sleep: async () => undefined,
     });
 
-    expect(
-      Object.fromEntries(formBody(fetchImplementation.mock.calls[0])).code
-    ).toBe('bare-code');
+    expect(openBrowser).toHaveBeenCalledWith(
+      deviceCode.verificationUriComplete
+    );
   });
 
   it('signs in over a corrupt credentials file and keeps a backup', async () => {
@@ -550,6 +579,7 @@ describe('login', () => {
     await writeFile(getCredentialsPath(), '{not json', 'utf8');
     const fetchImplementation = vi
       .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(deviceCodeResponse()))
       .mockResolvedValueOnce(
         jsonResponse(tokenResponse('access-2', 'refresh-2'))
       );
@@ -559,22 +589,67 @@ describe('login', () => {
       apiResource,
       fetch: fetchImplementation,
       noBrowser: true,
-      promptForCallback: async () => 'bare-code',
+      onDeviceCode: () => undefined,
+      sleep: async () => undefined,
     });
 
     expect((await readOAuthTokens(authBaseUrl))?.accessToken).toBe('access-2');
     expect(await corruptBackups()).toHaveLength(1);
   });
+});
 
-  it('fails clearly when headless and no paste handler is provided', async () => {
+describe('device authorization grant', () => {
+  it('surfaces provider errors when requesting a code', async () => {
     await expect(
-      login({
+      requestDeviceCode({
         authBaseUrl,
         apiResource,
-        fetch: vi.fn<typeof fetch>(),
-        noBrowser: true,
+        fetch: vi
+          .fn<typeof fetch>()
+          .mockResolvedValue(
+            jsonResponse({ error: 'unauthorized_client' }, 400)
+          ),
       })
-    ).rejects.toThrow('no way to receive the sign-in code');
+    ).rejects.toThrow('does not recognize the gt CLI');
+  });
+
+  it('backs off on slow_down and stops on a terminal error', async () => {
+    const fetchImplementation = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({ error: 'slow_down' }, 400))
+      .mockResolvedValueOnce(jsonResponse({ error: 'access_denied' }, 400));
+    const sleep = vi.fn(async (_milliseconds: number) => undefined);
+
+    await expect(
+      pollDeviceToken({
+        authBaseUrl,
+        apiResource,
+        deviceCode,
+        fetch: fetchImplementation,
+        sleep,
+      })
+    ).rejects.toThrow('Sign in was denied in the browser');
+    expect(sleep.mock.calls.map(([ms]) => ms)).toEqual([5_000, 10_000]);
+  });
+
+  it('gives up once the code expires', async () => {
+    let clock = 0;
+    await expect(
+      pollDeviceToken({
+        authBaseUrl,
+        apiResource,
+        deviceCode: { ...deviceCode, expiresIn: 12 },
+        fetch: vi
+          .fn<typeof fetch>()
+          .mockImplementation(async () =>
+            jsonResponse({ error: 'authorization_pending' }, 400)
+          ),
+        now: () => clock,
+        sleep: async (ms) => {
+          clock += ms;
+        },
+      })
+    ).rejects.toThrow('expired before it was approved');
   });
 });
 

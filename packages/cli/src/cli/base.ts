@@ -673,7 +673,7 @@ export class BaseCLI {
       .description('Sign in to your General Translation account')
       .option(
         '--no-browser',
-        'Print the sign-in URL instead of opening a browser, then paste the redirect URL or code back'
+        'Do not open a browser; show a code to enter on any device instead'
       )
       .action(async (options: { browser: boolean }) => {
         displayHeader('Signing in to General Translation...');
@@ -682,19 +682,14 @@ export class BaseCLI {
             noBrowser: !options.browser,
             onAuthorizationUrl: (url) => {
               logger.message(
-                options.browser
-                  ? `Opening your browser to sign in. If it does not open, visit:\n${chalk.cyan(url)}`
-                  : `Visit this URL to sign in:\n${chalk.cyan(url)}`
+                `Opening your browser to sign in. If it does not open, visit:\n${chalk.cyan(url)}`
               );
             },
-            promptForCallback: () =>
-              promptText({
-                message:
-                  'Paste the URL your browser was redirected to (or just the code)',
-                validate: (value) =>
-                  value.trim().length > 0 ||
-                  'A redirect URL or code is required',
-              }),
+            onDeviceCode: ({ userCode, verificationUri }) => {
+              logger.message(
+                `${options.browser ? 'Opening your browser. If it does not open, on any device visit' : 'On any device, visit'} ${chalk.cyan(verificationUri)} and enter the code ${chalk.bold(userCode)}\nWaiting for approval...`
+              );
+            },
           });
           logger.endCommand('Signed in successfully.');
         } catch (error) {

@@ -14,11 +14,7 @@ import type { UserTokenProvider } from 'generaltranslation/api';
 import { defaultBaseUrl } from 'generaltranslation/internal';
 import { GT_DASHBOARD_URL } from '../utils/constants.js';
 import { logger } from '../console/logger.js';
-import {
-  parseAuthorizationCallback,
-  startLoopbackServer,
-  type AuthorizationCallback,
-} from './loopback.js';
+import { startLoopbackServer, type AuthorizationCallback } from './loopback.js';
 
 /**
  * Well-known public client seeded by gt-cloud (`GT_CLI_OAUTH_CLIENT_ID`).
@@ -43,12 +39,9 @@ export const OAUTH_CLIENT_ID = 'gt-cli';
 export const OAUTH_SCOPE =
   'openid profile offline_access project:files:read project:files:write project:translations:enqueue project:translations:generate project:context:write org:projects:create';
 
-/**
- * Registered on the seeded client; the provider matches loopback redirect URIs
- * ignoring the port (RFC 8252 §7.3), so the ephemeral port chosen at login
- * does not need to be registered.
- */
-const REGISTERED_REDIRECT_URI = 'http://127.0.0.1/callback';
+const DEVICE_CODE_GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:device_code';
+// RFC 8628 §3.5: add 5 seconds to the polling interval on `slow_down`.
+const SLOW_DOWN_INCREMENT_SECONDS = 5;
 // Distinct from defaultTimeout on purpose: refresh slightly before expiry so
 // an in-flight request never carries a token that expires mid-request.
 const TOKEN_REFRESH_BUFFER_MS = 30_000;
@@ -71,6 +64,15 @@ type StoredCredentials = {
   servers: Record<string, StoredServerCredentials>;
 };
 
+export type DeviceCode = {
+  deviceCode: string;
+  expiresIn: number;
+  interval: number;
+  userCode: string;
+  verificationUri: string;
+  verificationUriComplete?: string;
+};
+
 export type UserInfo = {
   email?: string;
   name?: string;
@@ -86,16 +88,17 @@ type OpenBrowser = (url: string) => Promise<unknown>;
 
 export type LoginOptions = OAuthRequestOptions & {
   apiResource?: string;
-  /** Skip opening a browser; the URL is still reported through onAuthorizationUrl. */
-  noBrowser?: boolean;
-  onAuthorizationUrl?: (url: string) => void;
-  openBrowser?: OpenBrowser;
   /**
-   * Headless fallback: called when the loopback listener cannot receive the
-   * redirect (bind failure, remote shell, or --no-browser). Should return the
-   * full redirect URL or the bare authorization code the user pasted.
+   * Use the device grant without opening a browser: the verification URL and
+   * user code are reported through onDeviceCode for the user to enter elsewhere.
    */
-  promptForCallback?: () => Promise<string>;
+  noBrowser?: boolean;
+  now?: () => number;
+  onAuthorizationUrl?: (url: string) => void;
+  /** Called when login falls back to the device grant, before polling starts. */
+  onDeviceCode?: (deviceCode: DeviceCode) => void;
+  openBrowser?: OpenBrowser;
+  sleep?: (milliseconds: number) => Promise<void>;
   timeoutMs?: number;
 };
 
@@ -180,6 +183,8 @@ function describeOAuthError(
   switch (error) {
     case 'access_denied':
       return 'Sign in was denied in the browser';
+    case 'expired_token':
+      return 'The sign-in code expired before it was approved. Run `gt login` again';
     case 'invalid_scope':
       return `The authorization server rejected the requested scopes${description ? `: ${description}` : ''}`;
     case 'invalid_grant':
@@ -413,23 +418,9 @@ export async function exchangeAuthorizationCode({
   return parseTokens(await readJson(response));
 }
 
-/**
- * Accepts either the full redirect URL or a bare authorization code pasted by
- * the user when the loopback redirect cannot reach this process.
- */
-export function parsePastedCallback(input: string): AuthorizationCallback {
-  const trimmed = input.trim();
-  if (!trimmed) return {};
-  if (/^https?:\/\//i.test(trimmed)) {
-    return parseAuthorizationCallback(trimmed);
-  }
-  return { code: trimmed };
-}
-
 function assertCallback(
   callback: AuthorizationCallback,
-  expectedState: string,
-  stateRequired: boolean
+  expectedState: string
 ): string {
   if (callback.error) {
     throw new OAuthError(
@@ -441,10 +432,7 @@ function assertCallback(
       callback.error
     );
   }
-  if (
-    (stateRequired || callback.state !== undefined) &&
-    callback.state !== expectedState
-  ) {
+  if (callback.state !== expectedState) {
     throw new Error(
       'Sign in response did not match this login attempt (state mismatch). Run `gt login` again'
     );
@@ -455,59 +443,171 @@ function assertCallback(
   return callback.code;
 }
 
+// ---------------------------------------------------------------------------
+// Device authorization grant (RFC 8628)
+// ---------------------------------------------------------------------------
+
+export async function requestDeviceCode({
+  authBaseUrl = getAuthBaseUrl(),
+  apiResource = getApiResource(),
+  fetch: fetchImplementation = globalThis.fetch,
+}: OAuthRequestOptions & { apiResource?: string } = {}): Promise<DeviceCode> {
+  const response = await fetchImplementation(`${authBaseUrl}/device/code`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: OAUTH_CLIENT_ID,
+      scope: OAUTH_SCOPE,
+      resource: apiResource,
+    }),
+  });
+  if (!response.ok) {
+    throw await createOAuthError(response, 'Could not start sign in');
+  }
+  const value = await readJson(response);
+  return {
+    deviceCode: stringField(value, 'device_code'),
+    expiresIn: numberField(value, 'expires_in'),
+    interval: numberField(value, 'interval'),
+    userCode: stringField(value, 'user_code'),
+    verificationUri: stringField(value, 'verification_uri'),
+    verificationUriComplete: optionalStringField(
+      value,
+      'verification_uri_complete'
+    ),
+  };
+}
+
+export async function pollDeviceToken({
+  authBaseUrl = getAuthBaseUrl(),
+  apiResource = getApiResource(),
+  deviceCode,
+  fetch: fetchImplementation = globalThis.fetch,
+  now = Date.now,
+  sleep = (milliseconds) =>
+    new Promise((resolve) => setTimeout(resolve, milliseconds)),
+}: OAuthRequestOptions & {
+  apiResource?: string;
+  deviceCode: DeviceCode;
+  now?: () => number;
+  sleep?: (milliseconds: number) => Promise<void>;
+}): Promise<OAuthTokens> {
+  const deadline = now() + deviceCode.expiresIn * 1000;
+  let intervalSeconds = deviceCode.interval;
+
+  while (now() < deadline) {
+    await sleep(intervalSeconds * 1000);
+    const response = await fetchImplementation(`${authBaseUrl}/oauth2/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: DEVICE_CODE_GRANT_TYPE,
+        client_id: OAUTH_CLIENT_ID,
+        device_code: deviceCode.deviceCode,
+        resource: apiResource,
+      }),
+    });
+    const value = await readJson(response);
+    if (response.ok) return parseTokens(value, undefined, now());
+
+    const error = optionalStringField(value, 'error');
+    if (error === 'authorization_pending') continue;
+    if (error === 'slow_down') {
+      intervalSeconds += SLOW_DOWN_INCREMENT_SECONDS;
+      continue;
+    }
+    throw new Error(
+      describeOAuthError(
+        error,
+        optionalStringField(value, 'error_description'),
+        'Sign in failed'
+      )
+    );
+  }
+  throw new Error(describeOAuthError('expired_token', undefined, ''));
+}
+
+async function loginWithDeviceCode(
+  options: LoginOptions,
+  authBaseUrl: string,
+  apiResource: string
+): Promise<OAuthTokens> {
+  const deviceCode = await requestDeviceCode({
+    authBaseUrl,
+    apiResource,
+    fetch: options.fetch,
+  });
+  options.onDeviceCode?.(deviceCode);
+  if (!options.noBrowser) {
+    await (options.openBrowser ?? open)(
+      deviceCode.verificationUriComplete ?? deviceCode.verificationUri
+    ).catch(() => undefined);
+  }
+  const tokens = await pollDeviceToken({
+    authBaseUrl,
+    apiResource,
+    deviceCode,
+    fetch: options.fetch,
+    now: options.now,
+    sleep: options.sleep,
+  });
+  await writeOAuthTokens(tokens, authBaseUrl);
+  return tokens;
+}
+
+// ---------------------------------------------------------------------------
+// Login
+// ---------------------------------------------------------------------------
+
+/**
+ * Authorization code + PKCE over a loopback redirect when a browser can open
+ * on this machine; otherwise (`--no-browser`, or the loopback listener cannot
+ * bind) the device grant, where the user enters a short code on any device.
+ */
 export async function login(options: LoginOptions = {}): Promise<OAuthTokens> {
   const authBaseUrl = options.authBaseUrl ?? getAuthBaseUrl();
   const apiResource = options.apiResource ?? getApiResource();
-  const requestOptions = { authBaseUrl, fetch: options.fetch };
+  if (options.noBrowser) {
+    return loginWithDeviceCode(options, authBaseUrl, apiResource);
+  }
+  let loopback: Awaited<ReturnType<typeof startLoopbackServer>>;
+  try {
+    loopback = await startLoopbackServer();
+  } catch {
+    return loginWithDeviceCode(options, authBaseUrl, apiResource);
+  }
+
   const { codeVerifier, codeChallenge } = createPkcePair();
   const state = randomBytes(16).toString('base64url');
 
-  // A failed bind falls through to the paste-the-code flow below.
-  const loopback = options.noBrowser
-    ? undefined
-    : await startLoopbackServer().catch(() => undefined);
-  const redirectUri = loopback?.redirectUri ?? REGISTERED_REDIRECT_URI;
-
   let code: string;
   try {
-    const callback = loopback?.waitForCallback(options.timeoutMs);
-    callback?.catch(() => undefined);
+    const callback = loopback.waitForCallback(options.timeoutMs);
+    callback.catch(() => undefined);
     const authorizationUrl = buildAuthorizationUrl({
       authBaseUrl,
       clientId: OAUTH_CLIENT_ID,
-      redirectUri,
+      redirectUri: loopback.redirectUri,
       codeChallenge,
       state,
       apiResource,
     });
     options.onAuthorizationUrl?.(authorizationUrl);
-    if (!options.noBrowser) {
-      await (options.openBrowser ?? open)(authorizationUrl).catch(
-        () => undefined
-      );
-    }
-
-    if (callback) {
-      code = assertCallback(await callback, state, true);
-    } else {
-      if (!options.promptForCallback) {
-        throw new Error(
-          'No browser is available and no way to receive the sign-in code was provided'
-        );
-      }
-      const pasted = parsePastedCallback(await options.promptForCallback());
-      code = assertCallback(pasted, state, false);
-    }
+    await (options.openBrowser ?? open)(authorizationUrl).catch(
+      () => undefined
+    );
+    code = assertCallback(await callback, state);
   } finally {
-    loopback?.close();
+    loopback.close();
   }
 
   const tokens = await exchangeAuthorizationCode({
-    ...requestOptions,
+    authBaseUrl,
+    fetch: options.fetch,
     clientId: OAUTH_CLIENT_ID,
     code,
     codeVerifier,
-    redirectUri,
+    redirectUri: loopback.redirectUri,
     apiResource,
   });
   await writeOAuthTokens(tokens, authBaseUrl);
