@@ -168,12 +168,39 @@ async function readOAuthError(
   return {};
 }
 
-async function getOAuthErrorMessage(
+class OAuthError extends Error {
+  constructor(
+    message: string,
+    readonly code?: string
+  ) {
+    super(message);
+  }
+}
+
+async function createOAuthError(
   response: Response,
   fallback: string
-): Promise<string> {
+): Promise<OAuthError> {
   const { error, description } = await readOAuthError(response);
-  return describeOAuthError(error, description, fallback);
+  return new OAuthError(
+    describeOAuthError(error, description, fallback),
+    error
+  );
+}
+
+/** A rejected client_id means the registration is gone; forget it so the next login re-registers. */
+async function forgetClientIfInvalid<T>(
+  authBaseUrl: string,
+  run: () => Promise<T>
+): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    if (error instanceof OAuthError && error.code === 'invalid_client') {
+      await updateServerCredentials(authBaseUrl, () => null);
+    }
+    throw error;
+  }
 }
 
 function describeOAuthError(
@@ -189,7 +216,7 @@ function describeOAuthError(
     case 'invalid_grant':
       return 'The sign-in code expired or was already used. Run `gt login` again';
     case 'invalid_client':
-      return 'The CLI client registration is no longer valid. Run `gt logout` and `gt login` again';
+      return 'The CLI client registration is no longer valid. Run `gt login` again';
     default:
       return description ?? error ?? fallback;
   }
@@ -442,9 +469,7 @@ export async function registerOAuthClient({
     }),
   });
   if (!response.ok) {
-    throw new Error(
-      await getOAuthErrorMessage(response, 'Could not register the CLI client')
-    );
+    throw await createOAuthError(response, 'Could not register the CLI client');
   }
   const value = await readJson(response);
   const client = {
@@ -526,9 +551,7 @@ export async function exchangeAuthorizationCode({
     }),
   });
   if (!response.ok) {
-    throw new Error(
-      await getOAuthErrorMessage(response, 'Could not complete sign in')
-    );
+    throw await createOAuthError(response, 'Could not complete sign in');
   }
   return parseTokens(await readJson(response));
 }
@@ -552,12 +575,13 @@ function assertCallback(
   stateRequired: boolean
 ): string {
   if (callback.error) {
-    throw new Error(
+    throw new OAuthError(
       describeOAuthError(
         callback.error,
         callback.errorDescription,
         'Sign in failed'
-      )
+      ),
+      callback.error
     );
   }
   if (
@@ -577,8 +601,21 @@ function assertCallback(
 export async function login(options: LoginOptions = {}): Promise<OAuthTokens> {
   const authBaseUrl = options.authBaseUrl ?? getAuthBaseUrl();
   const apiResource = options.apiResource ?? getApiResource();
+  const client = await getOrRegisterOAuthClient({
+    authBaseUrl,
+    fetch: options.fetch,
+  });
+  return forgetClientIfInvalid(authBaseUrl, () =>
+    authorize({ ...options, authBaseUrl, apiResource }, client)
+  );
+}
+
+async function authorize(
+  options: LoginOptions & { authBaseUrl: string; apiResource: string },
+  client: OAuthClient
+): Promise<OAuthTokens> {
+  const { authBaseUrl, apiResource } = options;
   const requestOptions = { authBaseUrl, fetch: options.fetch };
-  const client = await getOrRegisterOAuthClient(requestOptions);
   const { codeVerifier, codeChallenge } = createPkcePair();
   const state = randomBytes(16).toString('base64url');
 
@@ -650,7 +687,9 @@ export async function refreshOAuthTokens({
 }: OAuthRequestOptions = {}): Promise<OAuthTokens> {
   const pending = pendingRefreshes.get(authBaseUrl);
   if (pending) return pending;
-  const refresh = exchangeRefreshToken(authBaseUrl, fetchImplementation);
+  const refresh = forgetClientIfInvalid(authBaseUrl, () =>
+    exchangeRefreshToken(authBaseUrl, fetchImplementation)
+  );
   pendingRefreshes.set(authBaseUrl, refresh);
   try {
     return await refresh;
@@ -681,18 +720,20 @@ async function exchangeRefreshToken(
   if (!response.ok) {
     const { error, description } = await readOAuthError(response);
     if (
-      response.status === 401 ||
-      error === 'invalid_grant' ||
-      error === 'invalid_token'
+      error !== 'invalid_client' &&
+      (response.status === 401 ||
+        error === 'invalid_grant' ||
+        error === 'invalid_token')
     ) {
       throw new Error('Your login expired. Run `gt login` to sign in again');
     }
-    throw new Error(
+    throw new OAuthError(
       describeOAuthError(
         error,
         description,
         `Could not refresh your login (HTTP ${response.status})`
-      )
+      ),
+      error
     );
   }
   const tokens = parseTokens(await readJson(response), current);
@@ -773,11 +814,9 @@ export async function whoAmI({
     headers: { Authorization: `Bearer ${accessToken}` },
   });
   if (!response.ok) {
-    throw new Error(
-      await getOAuthErrorMessage(
-        response,
-        `Could not load your account (HTTP ${response.status})`
-      )
+    throw await createOAuthError(
+      response,
+      `Could not load your account (HTTP ${response.status})`
     );
   }
   const value = await readJson(response);

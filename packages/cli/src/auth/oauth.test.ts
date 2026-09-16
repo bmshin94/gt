@@ -693,6 +693,21 @@ describe('OAuth session operations', () => {
     ).rejects.toThrow('Your login expired. Run `gt login` to sign in again');
   });
 
+  it('forgets the stored client when the server rejects it as invalid_client', async () => {
+    await writeOAuthTokens({ ...tokens, expiresAt: 0 }, authBaseUrl);
+
+    await expect(
+      refreshOAuthTokens({
+        authBaseUrl,
+        fetch: vi
+          .fn<typeof fetch>()
+          .mockResolvedValue(jsonResponse({ error: 'invalid_client' }, 401)),
+      })
+    ).rejects.toThrow('Run `gt login` again');
+    expect(await readOAuthClient(authBaseUrl)).toBeUndefined();
+    expect(await readOAuthTokens(authBaseUrl)).toBeUndefined();
+  });
+
   it('reports the HTTP status when refresh fails for another reason', async () => {
     await writeOAuthTokens({ ...tokens, expiresAt: 0 }, authBaseUrl);
 

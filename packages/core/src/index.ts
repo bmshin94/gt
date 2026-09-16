@@ -101,7 +101,6 @@ import {
 import { GTRuntime } from './runtime';
 
 export { GTRuntime, type GTConstructorParams } from './runtime';
-export type { UserTokenProvider } from '@generaltranslation/api';
 export { decodeVars } from './derive/decodeVars';
 export { declareVar } from './derive/declareVar';
 export { derive } from './derive/derive';
