@@ -10,7 +10,7 @@ import {
 import { homedir } from 'node:os';
 import path from 'node:path';
 import open from 'open';
-import type { UserTokenProvider } from 'generaltranslation';
+import type { UserTokenProvider } from 'generaltranslation/api';
 import { defaultBaseUrl } from 'generaltranslation/internal';
 import { GT_DASHBOARD_URL } from '../utils/constants.js';
 import { logger } from '../console/logger.js';
