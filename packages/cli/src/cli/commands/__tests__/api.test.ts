@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { writeOAuthClient, writeOAuthTokens } from '../../../auth/oauth.js';
 import { handleApiCommand } from '../api.js';
 
 const temporaryDirectories: string[] = [];
@@ -67,6 +68,51 @@ describe('gt api', () => {
 
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(outputText(stdout)).toBe(responseBody);
+  });
+
+  it('sends the signed-in user token when no API key is configured', async () => {
+    const configHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gt-api-auth-'));
+    temporaryDirectories.push(configHome);
+    const previousEnv = {
+      GT_API_KEY: process.env.GT_API_KEY,
+      XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+    };
+    delete process.env.GT_API_KEY;
+    process.env.XDG_CONFIG_HOME = configHome;
+    try {
+      await writeOAuthClient({
+        clientId: 'client-1',
+        redirectUri: 'http://127.0.0.1/callback',
+      });
+      await writeOAuthTokens({
+        accessToken: 'user-access-token',
+        expiresAt: Date.now() + 3_600_000,
+        refreshToken: 'refresh-1',
+        scope: 'openid',
+        tokenType: 'Bearer',
+      });
+      const fetchMock = vi.fn<typeof fetch>(async (request) => {
+        expect(new Request(request).headers.get('authorization')).toBe(
+          'Bearer user-access-token'
+        );
+        return new Response('{}', {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+
+      await handleApiCommand(
+        'v2/example',
+        { method: 'get', projectId: 'project-id' },
+        { fetch: fetchMock, writeStdout: () => undefined }
+      );
+
+      expect(fetchMock).toHaveBeenCalledOnce();
+    } finally {
+      for (const [name, value] of Object.entries(previousEnv)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
   });
 
   it('does not validate translation settings for raw API requests', async () => {

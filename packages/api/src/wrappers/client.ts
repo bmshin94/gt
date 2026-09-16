@@ -33,8 +33,10 @@ function createUserTokenFetch(
 ): typeof fetch {
   return async (input, init) => {
     const request = new Request(input, init);
+    if (request.headers.has('Authorization'))
+      return fetchImplementation(request);
     const accessToken = await provider.getAccessToken();
-    if (accessToken && !request.headers.has('Authorization')) {
+    if (accessToken) {
       request.headers.set('Authorization', `Bearer ${accessToken}`);
     }
 

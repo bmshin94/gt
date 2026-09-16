@@ -10,6 +10,7 @@ import {
 import { homedir } from 'node:os';
 import path from 'node:path';
 import open from 'open';
+import type { UserTokenProvider } from 'generaltranslation';
 import { defaultBaseUrl } from 'generaltranslation/internal';
 import { GT_DASHBOARD_URL } from '../utils/constants.js';
 import { logger } from '../console/logger.js';
@@ -150,23 +151,29 @@ async function readJson(response: Response): Promise<Record<string, unknown>> {
   return value;
 }
 
-async function getOAuthErrorMessage(
-  response: Response,
-  fallback: string
-): Promise<string> {
+async function readOAuthError(
+  response: Response
+): Promise<{ error?: string; description?: string }> {
   try {
     const value: unknown = await response.json();
     if (isRecord(value)) {
-      return describeOAuthError(
-        optionalStringField(value, 'error'),
-        optionalStringField(value, 'error_description'),
-        fallback
-      );
+      return {
+        error: optionalStringField(value, 'error'),
+        description: optionalStringField(value, 'error_description'),
+      };
     }
   } catch {
     // OAuth servers may return an empty or non-JSON error response.
   }
-  return fallback;
+  return {};
+}
+
+async function getOAuthErrorMessage(
+  response: Response,
+  fallback: string
+): Promise<string> {
+  const { error, description } = await readOAuthError(response);
+  return describeOAuthError(error, description, fallback);
 }
 
 function describeOAuthError(
@@ -200,7 +207,8 @@ function parseTokens(
       optionalStringField(value, 'refresh_token') ??
       previous?.refreshToken ??
       '',
-    scope: optionalStringField(value, 'scope') ?? previous?.scope ?? '',
+    scope:
+      optionalStringField(value, 'scope') ?? previous?.scope ?? OAUTH_SCOPE,
     tokenType:
       optionalStringField(value, 'token_type') ??
       previous?.tokenType ??
@@ -271,7 +279,8 @@ async function readCredentialsFile(
         server.tokens = {
           access_token: stringField(entry.tokens, 'access_token'),
           expires_at: numberField(entry.tokens, 'expires_at'),
-          refresh_token: stringField(entry.tokens, 'refresh_token'),
+          refresh_token:
+            optionalStringField(entry.tokens, 'refresh_token') ?? '',
           scope: stringField(entry.tokens, 'scope'),
           token_type: stringField(entry.tokens, 'token_type'),
         };
@@ -583,26 +592,27 @@ export async function login(options: LoginOptions = {}): Promise<OAuthTokens> {
   }
   const redirectUri = loopback?.redirectUri ?? client.redirectUri;
 
-  const authorizationUrl = buildAuthorizationUrl({
-    authBaseUrl,
-    clientId: client.clientId,
-    redirectUri,
-    codeChallenge,
-    state,
-    apiResource,
-  });
-  options.onAuthorizationUrl?.(authorizationUrl);
-  if (!options.noBrowser) {
-    await (options.openBrowser ?? open)(authorizationUrl).catch(
-      () => undefined
-    );
-  }
-
   let code: string;
   try {
-    if (loopback) {
-      const callback = await loopback.waitForCallback(options.timeoutMs);
-      code = assertCallback(callback, state, true);
+    const callback = loopback?.waitForCallback(options.timeoutMs);
+    callback?.catch(() => undefined);
+    const authorizationUrl = buildAuthorizationUrl({
+      authBaseUrl,
+      clientId: client.clientId,
+      redirectUri,
+      codeChallenge,
+      state,
+      apiResource,
+    });
+    options.onAuthorizationUrl?.(authorizationUrl);
+    if (!options.noBrowser) {
+      await (options.openBrowser ?? open)(authorizationUrl).catch(
+        () => undefined
+      );
+    }
+
+    if (callback) {
+      code = assertCallback(await callback, state, true);
     } else {
       if (!options.promptForCallback) {
         throw new Error(
@@ -669,7 +679,21 @@ async function exchangeRefreshToken(
     }),
   });
   if (!response.ok) {
-    throw new Error('Your login expired. Run `gt login` to sign in again');
+    const { error, description } = await readOAuthError(response);
+    if (
+      response.status === 401 ||
+      error === 'invalid_grant' ||
+      error === 'invalid_token'
+    ) {
+      throw new Error('Your login expired. Run `gt login` to sign in again');
+    }
+    throw new Error(
+      describeOAuthError(
+        error,
+        description,
+        `Could not refresh your login (HTTP ${response.status})`
+      )
+    );
   }
   const tokens = parseTokens(await readJson(response), current);
   await writeOAuthTokens(tokens, authBaseUrl);
@@ -688,6 +712,18 @@ export async function getValidAccessToken(
   return (await refreshOAuthTokens({ ...options, authBaseUrl })).accessToken;
 }
 
+/** API client credentials backed by the signed-in user; reads and refreshes lazily. */
+export function createUserTokenProvider(): UserTokenProvider {
+  return {
+    getAccessToken: async () => {
+      const accessToken = await getValidAccessToken();
+      if (!accessToken) throw new Error('Run `gt login` to sign in');
+      return accessToken;
+    },
+    refreshAccessToken: async () => (await refreshOAuthTokens()).accessToken,
+  };
+}
+
 export async function logout({
   authBaseUrl = getAuthBaseUrl(),
   fetch: fetchImplementation = globalThis.fetch,
@@ -701,15 +737,23 @@ export async function logout({
   const client = stored?.client;
   try {
     if (tokens?.refresh_token && client) {
-      await fetchImplementation(`${authBaseUrl}/oauth2/revoke`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          client_id: client.client_id,
-          token: tokens.refresh_token,
-          token_type_hint: 'refresh_token',
-        }),
-      });
+      const response = await fetchImplementation(
+        `${authBaseUrl}/oauth2/revoke`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            client_id: client.client_id,
+            token: tokens.refresh_token,
+            token_type_hint: 'refresh_token',
+          }),
+        }
+      );
+      if (!response.ok) {
+        logger.warn(
+          `Signed out locally, but the authorization server did not revoke the session (HTTP ${response.status})`
+        );
+      }
     }
   } finally {
     await deleteOAuthTokens(authBaseUrl);
@@ -728,7 +772,14 @@ export async function whoAmI({
   const response = await fetchImplementation(`${authBaseUrl}/oauth2/userinfo`, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
-  if (!response.ok) throw new Error('Could not load your account');
+  if (!response.ok) {
+    throw new Error(
+      await getOAuthErrorMessage(
+        response,
+        `Could not load your account (HTTP ${response.status})`
+      )
+    );
+  }
   const value = await readJson(response);
   return {
     sub: stringField(value, 'sub'),

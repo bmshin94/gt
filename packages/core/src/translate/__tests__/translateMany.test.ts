@@ -307,6 +307,22 @@ describe.sequential('_translateMany', () => {
     );
   });
 
+  it('forwards the user token provider to the API client', async () => {
+    const userTokenProvider = {
+      getAccessToken: () => 'user-token',
+      refreshAccessToken: async () => 'refreshed-token',
+    };
+
+    await _translateMany([], globalMetadata, {
+      projectId: 'test-project',
+      userTokenProvider,
+    });
+
+    expect(createApiClient).toHaveBeenCalledWith(
+      expect.objectContaining({ apiKey: undefined, userTokenProvider })
+    );
+  });
+
   it('preserves custom model-provider strings in request metadata', async () => {
     const metadata = {
       ...globalMetadata,

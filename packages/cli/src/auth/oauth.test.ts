@@ -14,6 +14,7 @@ import { logger } from '../console/logger.js';
 import {
   buildAuthorizationUrl,
   createPkcePair,
+  createUserTokenProvider,
   deleteOAuthTokens,
   exchangeAuthorizationCode,
   getApiResource,
@@ -94,6 +95,7 @@ afterEach(async () => {
   await rm(configHome, { recursive: true, force: true });
   delete process.env.XDG_CONFIG_HOME;
   delete process.env.GT_API_URL;
+  delete process.env.GT_AUTH_URL;
 });
 
 describe('OAuth credential storage', () => {
@@ -347,6 +349,30 @@ describe('authorization code exchange', () => {
     });
   });
 
+  it('stores tokens that omit scope and refresh_token so they read back', async () => {
+    const response = tokenResponse('access-2', 'unused');
+    delete response.scope;
+    delete response.refresh_token;
+
+    const result = await exchangeAuthorizationCode({
+      authBaseUrl,
+      fetch: vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(response)),
+      clientId: 'client-1',
+      code: 'code-1',
+      codeVerifier: 'verifier-1',
+      redirectUri: 'http://127.0.0.1:4242/callback',
+      apiResource,
+    });
+    await writeOAuthTokens(result, authBaseUrl);
+
+    expect(result.scope).toBe(OAUTH_SCOPE);
+    expect(await readOAuthTokens(authBaseUrl)).toMatchObject({
+      accessToken: 'access-2',
+      refreshToken: '',
+      scope: OAUTH_SCOPE,
+    });
+  });
+
   it('explains expired or reused codes', async () => {
     await expect(
       exchangeAuthorizationCode({
@@ -473,6 +499,52 @@ describe('login', () => {
     ).rejects.toThrow('state mismatch');
     expect(fetchImplementation).not.toHaveBeenCalled();
     expect(await readOAuthTokens(authBaseUrl)).toBeUndefined();
+  });
+
+  it('handles a callback that arrives before the browser launcher returns', async () => {
+    await writeOAuthClient(client, authBaseUrl);
+    const fetchImplementation = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse(tokenResponse('access-2', 'refresh-2'))
+      );
+    const openBrowser = vi.fn(async (url: string) => {
+      const authorize = new URL(url);
+      const redirect = new URL(authorize.searchParams.get('redirect_uri')!);
+      redirect.searchParams.set('code', 'code-1');
+      redirect.searchParams.set('state', authorize.searchParams.get('state')!);
+      const response = await fetch(redirect);
+      expect(response.status).toBe(200);
+    });
+
+    const result = await login({
+      authBaseUrl,
+      apiResource,
+      fetch: fetchImplementation,
+      openBrowser,
+      timeoutMs: 5_000,
+    });
+
+    expect(result.accessToken).toBe('access-2');
+  });
+
+  it('closes the loopback server when publishing the URL fails', async () => {
+    await writeOAuthClient(client, authBaseUrl);
+    let redirectUri = '';
+
+    await expect(
+      login({
+        authBaseUrl,
+        apiResource,
+        fetch: vi.fn<typeof fetch>(),
+        openBrowser: vi.fn(),
+        onAuthorizationUrl: (url) => {
+          redirectUri = new URL(url).searchParams.get('redirect_uri')!;
+          throw new Error('cannot print');
+        },
+      })
+    ).rejects.toThrow('cannot print');
+    await expect(fetch(redirectUri)).rejects.toThrow();
   });
 
   it('reports access_denied from the provider', async () => {
@@ -608,6 +680,35 @@ describe('OAuth session operations', () => {
     await writeOAuthClient(client, authBaseUrl);
   });
 
+  it('reports expired login when refresh is rejected with invalid_grant', async () => {
+    await writeOAuthTokens({ ...tokens, expiresAt: 0 }, authBaseUrl);
+
+    await expect(
+      refreshOAuthTokens({
+        authBaseUrl,
+        fetch: vi
+          .fn<typeof fetch>()
+          .mockResolvedValue(jsonResponse({ error: 'invalid_grant' }, 400)),
+      })
+    ).rejects.toThrow('Your login expired. Run `gt login` to sign in again');
+  });
+
+  it('reports the HTTP status when refresh fails for another reason', async () => {
+    await writeOAuthTokens({ ...tokens, expiresAt: 0 }, authBaseUrl);
+
+    await expect(
+      refreshOAuthTokens({
+        authBaseUrl,
+        fetch: vi
+          .fn<typeof fetch>()
+          .mockResolvedValue(new Response('<html>', { status: 503 })),
+      })
+    ).rejects.toThrow('Could not refresh your login (HTTP 503)');
+    expect((await readOAuthTokens(authBaseUrl))?.refreshToken).toBe(
+      'refresh-1'
+    );
+  });
+
   it('reports expired login when refresh fails with a non-JSON response', async () => {
     await writeOAuthTokens({ ...tokens, expiresAt: 0 }, authBaseUrl);
 
@@ -667,6 +768,17 @@ describe('OAuth session operations', () => {
     });
   });
 
+  it('creates a provider that reads lazily and reports a missing login', async () => {
+    process.env.GT_AUTH_URL = authBaseUrl;
+    const provider = createUserTokenProvider();
+
+    await expect(provider.getAccessToken()).rejects.toThrow(
+      'Run `gt login` to sign in'
+    );
+    await writeOAuthTokens(tokens, authBaseUrl);
+    await expect(provider.getAccessToken()).resolves.toBe('access-1');
+  });
+
   it('returns the cached access token while it is still fresh', async () => {
     await writeOAuthTokens(tokens, authBaseUrl);
     const fetchImplementation = vi.fn<typeof fetch>();
@@ -713,6 +825,24 @@ describe('OAuth session operations', () => {
       token: 'refresh-1',
       token_type_hint: 'refresh_token',
     });
+  });
+
+  it('warns when the server does not revoke the session but still signs out locally', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    await writeOAuthTokens(tokens, authBaseUrl);
+
+    await logout({
+      authBaseUrl,
+      fetch: vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(new Response(null, { status: 500 })),
+    });
+
+    expect(await readOAuthTokens(authBaseUrl)).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain(
+      'did not revoke the session (HTTP 500)'
+    );
   });
 
   it('signs out locally without revoking when the credentials file is corrupt', async () => {

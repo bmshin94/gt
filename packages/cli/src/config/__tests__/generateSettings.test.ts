@@ -4,7 +4,7 @@ import { resolveFiles } from '../../fs/config/parseFilesConfig';
 import { determineLibrary } from '../../fs/determineFramework/index.js';
 import { logger } from '../../console/logger.js';
 import { resolveConfig } from '../resolveConfig.js';
-import { getValidAccessToken, refreshOAuthTokens } from '../../auth/oauth.js';
+import { createUserTokenProvider } from '../../auth/oauth.js';
 import { configureApiClient } from '../../utils/api.js';
 import { gt } from '../../utils/gt.js';
 
@@ -74,8 +74,10 @@ vi.mock('../../utils/api.js', () => ({
 }));
 
 vi.mock('../../auth/oauth.js', () => ({
-  getValidAccessToken: vi.fn().mockResolvedValue(undefined),
-  refreshOAuthTokens: vi.fn(),
+  createUserTokenProvider: vi.fn(() => ({
+    getAccessToken: vi.fn(),
+    refreshAccessToken: vi.fn(),
+  })),
 }));
 
 vi.mock('../optionPresets.js', () => ({
@@ -110,7 +112,6 @@ describe('generateSettings - composite patterns', () => {
       library: 'base',
       additionalModules: [],
     });
-    vi.mocked(getValidAccessToken).mockResolvedValue(undefined);
   });
 
   it('should extract composite patterns from jsonSchema options and pass to resolveFiles', async () => {
@@ -385,50 +386,35 @@ describe('generateSettings - composite patterns', () => {
     );
   });
 
-  it('configures a lazy user token provider only when no explicit API key exists', async () => {
-    vi.mocked(getValidAccessToken).mockRejectedValue(
-      new Error('Stored OAuth credentials are invalid')
-    );
-    vi.mocked(refreshOAuthTokens).mockResolvedValue({
-      accessToken: 'refreshed-token',
-      expiresAt: Date.now() + 3_600_000,
-      refreshToken: 'refresh-token',
-      scope: 'api:read api:write',
-      tokenType: 'Bearer',
-    });
-
+  it('configures a lazy user token provider for both clients only when no explicit API key exists', async () => {
     const userSettings = await generateSettings({}, '/test/cwd');
     const keySettings = await generateSettings(
       { apiKey: 'explicit-api-key' },
       '/test/cwd'
     );
 
-    expect(getValidAccessToken).not.toHaveBeenCalled();
+    expect(createUserTokenProvider).toHaveBeenCalledTimes(1);
     expect(userSettings.apiKey).toBeUndefined();
-    expect(userSettings.userTokenProvider).toBeDefined();
+    expect(userSettings.userTokenProvider).toBe(
+      vi.mocked(createUserTokenProvider).mock.results[0].value
+    );
+    expect(
+      userSettings.userTokenProvider!.getAccessToken
+    ).not.toHaveBeenCalled();
     expect(vi.mocked(configureApiClient).mock.calls[0][0]).toMatchObject({
+      apiKey: undefined,
       userTokenProvider: userSettings.userTokenProvider,
     });
     expect(vi.mocked(gt.setConfig).mock.calls[0][0]).toMatchObject({
+      apiKey: undefined,
       userTokenProvider: userSettings.userTokenProvider,
     });
     expect(keySettings.apiKey).toBe('explicit-api-key');
     expect(keySettings.userTokenProvider).toBeUndefined();
-
-    await expect(
-      userSettings.userTokenProvider!.getAccessToken()
-    ).rejects.toThrow('Stored OAuth credentials are invalid');
-    vi.mocked(getValidAccessToken).mockResolvedValue(undefined);
-    await expect(
-      userSettings.userTokenProvider!.getAccessToken()
-    ).rejects.toThrow('Run `gt login` to sign in');
-    vi.mocked(getValidAccessToken).mockResolvedValue('user-access-token');
-    await expect(
-      userSettings.userTokenProvider!.getAccessToken()
-    ).resolves.toBe('user-access-token');
-    await expect(
-      userSettings.userTokenProvider!.refreshAccessToken()
-    ).resolves.toBe('refreshed-token');
+    expect(vi.mocked(configureApiClient).mock.calls[1][0]).toMatchObject({
+      apiKey: 'explicit-api-key',
+      userTokenProvider: undefined,
+    });
   });
 
   it('should not call resolveFiles when files are not provided', async () => {

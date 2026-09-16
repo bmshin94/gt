@@ -52,13 +52,14 @@ export async function startLoopbackServer(): Promise<LoopbackServer> {
   const server = createServer();
   const port = await listen(server);
   const origin = `http://127.0.0.1:${port}`;
+  let timeout: NodeJS.Timeout | undefined;
 
   return {
     redirectUri: `${origin}${LOOPBACK_CALLBACK_PATH}`,
     waitForCallback(timeoutMs = DEFAULT_CALLBACK_TIMEOUT_MS) {
       return new Promise((resolve, reject) => {
         let settled = false;
-        const timeout = setTimeout(() => {
+        timeout = setTimeout(() => {
           settled = true;
           server.close();
           reject(new Error('Timed out waiting for the browser to sign in'));
@@ -100,6 +101,7 @@ export async function startLoopbackServer(): Promise<LoopbackServer> {
       });
     },
     close() {
+      clearTimeout(timeout);
       server.close();
     },
   };

@@ -18,7 +18,7 @@ import {
   GT_DASHBOARD_URL,
 } from '../utils/constants.js';
 import { resolveProjectId } from '../fs/utils.js';
-import { getValidAccessToken, refreshOAuthTokens } from '../auth/oauth.js';
+import { createUserTokenProvider } from '../auth/oauth.js';
 import crypto from 'node:crypto';
 import { execSync } from 'node:child_process';
 import path from 'node:path';
@@ -210,14 +210,7 @@ export async function generateSettings(
   // Explicit keys remain the highest-precedence credential for automation.
   mergedOptions.apiKey = mergedOptions.apiKey || process.env.GT_API_KEY;
   if (!mergedOptions.apiKey) {
-    mergedOptions.userTokenProvider = {
-      getAccessToken: async () => {
-        const accessToken = await getValidAccessToken();
-        if (!accessToken) throw new Error('Run `gt login` to sign in');
-        return accessToken;
-      },
-      refreshAccessToken: async () => (await refreshOAuthTokens()).accessToken,
-    };
+    mergedOptions.userTokenProvider = createUserTokenProvider();
   }
 
   // Add projectId if not provided
