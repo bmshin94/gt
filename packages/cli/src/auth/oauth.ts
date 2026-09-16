@@ -20,7 +20,12 @@ import {
   type AuthorizationCallback,
 } from './loopback.js';
 
-export const OAUTH_CLIENT_NAME = 'General Translation CLI';
+/**
+ * Well-known public client seeded by gt-cloud (`GT_CLI_OAUTH_CLIENT_ID`).
+ * Public clients cannot prove their identity, so the id is not a secret; the
+ * provider still shows the consent screen on every login.
+ */
+export const OAUTH_CLIENT_ID = 'gt-cli';
 
 /**
  * Scopes requested by `gt login`. The provider rejects unknown scopes, so each
@@ -39,9 +44,9 @@ export const OAUTH_SCOPE =
   'openid profile offline_access project:files:read project:files:write project:translations:enqueue project:translations:generate project:context:write org:projects:create';
 
 /**
- * Registered once per authorization server; the provider matches loopback
- * redirect URIs ignoring the port (RFC 8252 §7.3), so the ephemeral port
- * chosen at login does not need to be re-registered.
+ * Registered on the seeded client; the provider matches loopback redirect URIs
+ * ignoring the port (RFC 8252 §7.3), so the ephemeral port chosen at login
+ * does not need to be registered.
  */
 const REGISTERED_REDIRECT_URI = 'http://127.0.0.1/callback';
 // Distinct from defaultTimeout on purpose: refresh slightly before expiry so
@@ -56,13 +61,7 @@ export type OAuthTokens = {
   tokenType: string;
 };
 
-export type OAuthClient = {
-  clientId: string;
-  redirectUri: string;
-};
-
 type StoredServerCredentials = {
-  client?: OAuthClient;
   tokens?: OAuthTokens;
 };
 
@@ -173,21 +172,6 @@ async function createOAuthError(
   );
 }
 
-/** A rejected client_id means the registration is gone; forget it so the next login re-registers. */
-async function forgetClientIfInvalid<T>(
-  authBaseUrl: string,
-  run: () => Promise<T>
-): Promise<T> {
-  try {
-    return await run();
-  } catch (error) {
-    if (error instanceof OAuthError && error.code === 'invalid_client') {
-      await updateServerCredentials(authBaseUrl, () => null);
-    }
-    throw error;
-  }
-}
-
 function describeOAuthError(
   error: string | undefined,
   description: string | undefined,
@@ -201,7 +185,8 @@ function describeOAuthError(
     case 'invalid_grant':
       return 'The sign-in code expired or was already used. Run `gt login` again';
     case 'invalid_client':
-      return 'The CLI client registration is no longer valid. Run `gt login` again';
+    case 'unauthorized_client':
+      return 'This authorization server does not recognize the gt CLI. Check GT_AUTH_URL or update the server';
     default:
       return description ?? error ?? fallback;
   }
@@ -313,7 +298,7 @@ async function updateServerCredentials(
 ): Promise<void> {
   const credentials = await readCredentialsFile();
   const next = update(credentials.servers[authBaseUrl] ?? {});
-  if (next === null || (!next.client && !next.tokens)) {
+  if (next === null || !next.tokens) {
     delete credentials.servers[authBaseUrl];
   } else {
     credentials.servers[authBaseUrl] = next;
@@ -341,29 +326,10 @@ export async function writeOAuthTokens(
   }));
 }
 
-/** Removes stored tokens; the client registration is kept for the next login. */
 export async function deleteOAuthTokens(
   authBaseUrl = getAuthBaseUrl()
 ): Promise<void> {
-  await updateServerCredentials(authBaseUrl, ({ client }) =>
-    client ? { client } : null
-  );
-}
-
-export async function readOAuthClient(
-  authBaseUrl = getAuthBaseUrl()
-): Promise<OAuthClient | undefined> {
-  return (await readCredentialsFile()).servers[authBaseUrl]?.client;
-}
-
-export async function writeOAuthClient(
-  client: OAuthClient,
-  authBaseUrl = getAuthBaseUrl()
-): Promise<void> {
-  await updateServerCredentials(authBaseUrl, (current) => ({
-    ...current,
-    client,
-  }));
+  await updateServerCredentials(authBaseUrl, () => null);
 }
 
 // ---------------------------------------------------------------------------
@@ -379,49 +345,6 @@ export function createPkcePair(
       .update(codeVerifier)
       .digest('base64url'),
   };
-}
-
-// ---------------------------------------------------------------------------
-// Dynamic client registration
-// ---------------------------------------------------------------------------
-
-export async function registerOAuthClient({
-  authBaseUrl = getAuthBaseUrl(),
-  fetch: fetchImplementation = globalThis.fetch,
-}: OAuthRequestOptions = {}): Promise<OAuthClient> {
-  const response = await fetchImplementation(`${authBaseUrl}/oauth2/register`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      client_name: OAUTH_CLIENT_NAME,
-      // Registration defaults application_type to "web", which rejects http
-      // loopback redirects; native permits http://127.0.0.1 on any port.
-      application_type: 'native',
-      redirect_uris: [REGISTERED_REDIRECT_URI],
-      grant_types: ['authorization_code', 'refresh_token'],
-      response_types: ['code'],
-      token_endpoint_auth_method: 'none',
-      scope: OAUTH_SCOPE,
-    }),
-  });
-  if (!response.ok) {
-    throw await createOAuthError(response, 'Could not register the CLI client');
-  }
-  const value = await readJson(response);
-  const client = {
-    clientId: stringField(value, 'client_id'),
-    redirectUri: REGISTERED_REDIRECT_URI,
-  };
-  await writeOAuthClient(client, authBaseUrl);
-  return client;
-}
-
-async function getOrRegisterOAuthClient(
-  options: OAuthRequestOptions
-): Promise<OAuthClient> {
-  return (
-    (await readOAuthClient(options.authBaseUrl)) ?? registerOAuthClient(options)
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -535,20 +458,6 @@ function assertCallback(
 export async function login(options: LoginOptions = {}): Promise<OAuthTokens> {
   const authBaseUrl = options.authBaseUrl ?? getAuthBaseUrl();
   const apiResource = options.apiResource ?? getApiResource();
-  const client = await getOrRegisterOAuthClient({
-    authBaseUrl,
-    fetch: options.fetch,
-  });
-  return forgetClientIfInvalid(authBaseUrl, () =>
-    authorize({ ...options, authBaseUrl, apiResource }, client)
-  );
-}
-
-async function authorize(
-  options: LoginOptions & { authBaseUrl: string; apiResource: string },
-  client: OAuthClient
-): Promise<OAuthTokens> {
-  const { authBaseUrl, apiResource } = options;
   const requestOptions = { authBaseUrl, fetch: options.fetch };
   const { codeVerifier, codeChallenge } = createPkcePair();
   const state = randomBytes(16).toString('base64url');
@@ -557,7 +466,7 @@ async function authorize(
   const loopback = options.noBrowser
     ? undefined
     : await startLoopbackServer().catch(() => undefined);
-  const redirectUri = loopback?.redirectUri ?? client.redirectUri;
+  const redirectUri = loopback?.redirectUri ?? REGISTERED_REDIRECT_URI;
 
   let code: string;
   try {
@@ -565,7 +474,7 @@ async function authorize(
     callback?.catch(() => undefined);
     const authorizationUrl = buildAuthorizationUrl({
       authBaseUrl,
-      clientId: client.clientId,
+      clientId: OAUTH_CLIENT_ID,
       redirectUri,
       codeChallenge,
       state,
@@ -595,7 +504,7 @@ async function authorize(
 
   const tokens = await exchangeAuthorizationCode({
     ...requestOptions,
-    clientId: client.clientId,
+    clientId: OAUTH_CLIENT_ID,
     code,
     codeVerifier,
     redirectUri,
@@ -617,9 +526,7 @@ export async function refreshOAuthTokens({
 }: OAuthRequestOptions = {}): Promise<OAuthTokens> {
   const pending = pendingRefreshes.get(authBaseUrl);
   if (pending) return pending;
-  const refresh = forgetClientIfInvalid(authBaseUrl, () =>
-    exchangeRefreshToken(authBaseUrl, fetchImplementation)
-  );
+  const refresh = exchangeRefreshToken(authBaseUrl, fetchImplementation);
   pendingRefreshes.set(authBaseUrl, refresh);
   try {
     return await refresh;
@@ -633,16 +540,13 @@ async function exchangeRefreshToken(
   fetchImplementation: typeof fetch
 ): Promise<OAuthTokens> {
   const current = await readOAuthTokens(authBaseUrl);
-  const client = await readOAuthClient(authBaseUrl);
-  if (!current?.refreshToken || !client) {
-    throw new Error('Run `gt login` to sign in');
-  }
+  if (!current?.refreshToken) throw new Error('Run `gt login` to sign in');
 
   const response = await fetchImplementation(`${authBaseUrl}/oauth2/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      client_id: client.clientId,
+      client_id: OAUTH_CLIENT_ID,
       grant_type: 'refresh_token',
       refresh_token: current.refreshToken,
     }),
@@ -700,16 +604,15 @@ export async function logout({
   fetch: fetchImplementation = globalThis.fetch,
 }: OAuthRequestOptions = {}): Promise<void> {
   const tokens = await readOAuthTokens(authBaseUrl);
-  const client = await readOAuthClient(authBaseUrl);
   try {
-    if (tokens?.refreshToken && client) {
+    if (tokens?.refreshToken) {
       const response = await fetchImplementation(
         `${authBaseUrl}/oauth2/revoke`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body: new URLSearchParams({
-            client_id: client.clientId,
+            client_id: OAUTH_CLIENT_ID,
             token: tokens.refreshToken,
             token_type_hint: 'refresh_token',
           }),

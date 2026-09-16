@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { writeOAuthClient, writeOAuthTokens } from '../../../auth/oauth.js';
+import { writeOAuthTokens } from '../../../auth/oauth.js';
 import { handleApiCommand } from '../api.js';
 
 const temporaryDirectories: string[] = [];
@@ -80,10 +80,6 @@ describe('gt api', () => {
     delete process.env.GT_API_KEY;
     process.env.XDG_CONFIG_HOME = configHome;
     try {
-      await writeOAuthClient({
-        clientId: 'client-1',
-        redirectUri: 'http://127.0.0.1/callback',
-      });
       await writeOAuthTokens({
         accessToken: 'user-access-token',
         expiresAt: Date.now() + 3_600_000,

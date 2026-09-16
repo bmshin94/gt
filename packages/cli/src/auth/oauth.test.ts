@@ -22,16 +22,13 @@ import {
   getValidAccessToken,
   login,
   logout,
+  OAUTH_CLIENT_ID,
   OAUTH_SCOPE,
   parsePastedCallback,
-  readOAuthClient,
   readOAuthTokens,
   refreshOAuthTokens,
-  registerOAuthClient,
   whoAmI,
-  writeOAuthClient,
   writeOAuthTokens,
-  type OAuthClient,
   type OAuthTokens,
 } from './oauth.js';
 
@@ -46,10 +43,7 @@ const tokens: OAuthTokens = {
   tokenType: 'Bearer',
 };
 
-const client: OAuthClient = {
-  clientId: 'client-1',
-  redirectUri: 'http://127.0.0.1/callback',
-};
+const registeredRedirectUri = 'http://127.0.0.1/callback';
 
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
@@ -99,14 +93,12 @@ afterEach(async () => {
 
 describe('OAuth credential storage', () => {
   it('writes a versioned credential file with owner-only permissions', async () => {
-    await writeOAuthClient(client, authBaseUrl);
     await writeOAuthTokens(tokens, authBaseUrl);
 
     expect(await readOAuthTokens(authBaseUrl)).toEqual(tokens);
-    expect(await readOAuthClient(authBaseUrl)).toEqual(client);
     expect(JSON.parse(await readFile(getCredentialsPath(), 'utf8'))).toEqual({
       version: 2,
-      servers: { [authBaseUrl]: { client, tokens } },
+      servers: { [authBaseUrl]: { tokens } },
     });
     if (process.platform !== 'win32') {
       expect((await stat(getCredentialsPath())).mode & 0o777).toBe(0o600);
@@ -138,14 +130,27 @@ describe('OAuth credential storage', () => {
     );
   });
 
-  it('keeps the client registration when tokens are deleted', async () => {
-    await writeOAuthClient(client, authBaseUrl);
+  it('removes the file once the last server is logged out', async () => {
     await writeOAuthTokens(tokens, authBaseUrl);
 
     await deleteOAuthTokens(authBaseUrl);
 
     expect(await readOAuthTokens(authBaseUrl)).toBeUndefined();
-    expect(await readOAuthClient(authBaseUrl)).toEqual(client);
+    await expect(stat(getCredentialsPath())).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('ignores the client registration older files stored', async () => {
+    await writeOAuthTokens(tokens, authBaseUrl);
+    const stored = JSON.parse(await readFile(getCredentialsPath(), 'utf8'));
+    stored.servers[authBaseUrl].client = {
+      client_id: 'client-1',
+      redirect_uri: registeredRedirectUri,
+    };
+    await writeFile(getCredentialsPath(), JSON.stringify(stored), 'utf8');
+
+    expect(await readOAuthTokens(authBaseUrl)).toEqual(tokens);
   });
 
   it('sets a malformed file aside and reads as logged out', async () => {
@@ -256,52 +261,6 @@ describe('PKCE and authorization URL', () => {
   });
 });
 
-describe('dynamic client registration', () => {
-  it('registers a native public client with a loopback redirect and persists it', async () => {
-    const fetchImplementation = vi
-      .fn<typeof fetch>()
-      .mockResolvedValue(jsonResponse({ client_id: 'client-9' }, 201));
-
-    const registered = await registerOAuthClient({
-      authBaseUrl,
-      fetch: fetchImplementation,
-    });
-
-    expect(registered).toEqual({
-      clientId: 'client-9',
-      redirectUri: 'http://127.0.0.1/callback',
-    });
-    expect(await readOAuthClient(authBaseUrl)).toEqual(registered);
-    const [url, init] = fetchImplementation.mock.calls[0];
-    expect(url).toBe(`${authBaseUrl}/oauth2/register`);
-    expect(JSON.parse(String(init?.body))).toEqual({
-      client_name: 'General Translation CLI',
-      application_type: 'native',
-      redirect_uris: ['http://127.0.0.1/callback'],
-      grant_types: ['authorization_code', 'refresh_token'],
-      response_types: ['code'],
-      token_endpoint_auth_method: 'none',
-      scope: OAUTH_SCOPE,
-    });
-  });
-
-  it('surfaces registration errors', async () => {
-    await expect(
-      registerOAuthClient({
-        authBaseUrl,
-        fetch: vi
-          .fn<typeof fetch>()
-          .mockResolvedValue(
-            jsonResponse(
-              { error: 'invalid_scope', error_description: 'nope' },
-              400
-            )
-          ),
-      })
-    ).rejects.toThrow('rejected the requested scopes: nope');
-  });
-});
-
 describe('authorization code exchange', () => {
   it('posts the PKCE verifier, redirect URI, and resource as a public client', async () => {
     const fetchImplementation = vi
@@ -388,8 +347,7 @@ describe('parsePastedCallback', () => {
 });
 
 describe('login', () => {
-  it('reuses the stored client, opens the browser, receives the loopback callback, and stores tokens', async () => {
-    await writeOAuthClient(client, authBaseUrl);
+  it('opens the browser as the seeded client, receives the loopback callback, and stores tokens', async () => {
     const fetchImplementation = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(
@@ -416,10 +374,10 @@ describe('login', () => {
     expect((await readOAuthTokens(authBaseUrl))?.refreshToken).toBe(
       'refresh-2'
     );
-    // Only the token exchange hit the provider; registration was skipped.
+    // Only the token exchange hit the provider; there is no registration step.
     expect(fetchImplementation).toHaveBeenCalledTimes(1);
     const authorizeUrl = new URL(openBrowser.mock.calls[0][0]);
-    expect(authorizeUrl.searchParams.get('client_id')).toBe('client-1');
+    expect(authorizeUrl.searchParams.get('client_id')).toBe(OAUTH_CLIENT_ID);
     expect(authorizeUrl.searchParams.get('redirect_uri')).toMatch(
       /^http:\/\/127\.0\.0\.1:\d+\/callback$/
     );
@@ -433,39 +391,7 @@ describe('login', () => {
     expect(exchange.code_verifier).toMatch(/^[A-Za-z0-9_-]{43}$/);
   });
 
-  it('registers a client on first login', async () => {
-    const fetchImplementation = vi
-      .fn<typeof fetch>()
-      .mockResolvedValueOnce(jsonResponse({ client_id: 'client-new' }, 201))
-      .mockResolvedValueOnce(
-        jsonResponse(tokenResponse('access-2', 'refresh-2'))
-      );
-    const openBrowser = vi.fn(async (url: string) => {
-      const authorize = new URL(url);
-      const redirect = new URL(authorize.searchParams.get('redirect_uri')!);
-      redirect.searchParams.set('code', 'code-1');
-      redirect.searchParams.set('state', authorize.searchParams.get('state')!);
-      void fetch(redirect);
-    });
-
-    await login({
-      authBaseUrl,
-      apiResource,
-      fetch: fetchImplementation,
-      openBrowser,
-    });
-
-    expect(fetchImplementation.mock.calls[0][0]).toBe(
-      `${authBaseUrl}/oauth2/register`
-    );
-    expect(await readOAuthClient(authBaseUrl)).toEqual({
-      clientId: 'client-new',
-      redirectUri: 'http://127.0.0.1/callback',
-    });
-  });
-
   it('rejects a callback whose state does not match', async () => {
-    await writeOAuthClient(client, authBaseUrl);
     const fetchImplementation = vi.fn<typeof fetch>();
     const openBrowser = vi.fn(async (url: string) => {
       const redirect = new URL(new URL(url).searchParams.get('redirect_uri')!);
@@ -487,7 +413,6 @@ describe('login', () => {
   });
 
   it('handles a callback that arrives before the browser launcher returns', async () => {
-    await writeOAuthClient(client, authBaseUrl);
     const fetchImplementation = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(
@@ -514,7 +439,6 @@ describe('login', () => {
   });
 
   it('closes the loopback server when publishing the URL fails', async () => {
-    await writeOAuthClient(client, authBaseUrl);
     let redirectUri = '';
 
     await expect(
@@ -533,7 +457,6 @@ describe('login', () => {
   });
 
   it('reports access_denied from the provider', async () => {
-    await writeOAuthClient(client, authBaseUrl);
     const openBrowser = vi.fn(async (url: string) => {
       const authorize = new URL(url);
       const redirect = new URL(authorize.searchParams.get('redirect_uri')!);
@@ -553,7 +476,6 @@ describe('login', () => {
   });
 
   it('times out when the browser never returns', async () => {
-    await writeOAuthClient(client, authBaseUrl);
     await expect(
       login({
         authBaseUrl,
@@ -566,7 +488,6 @@ describe('login', () => {
   });
 
   it('falls back to a pasted redirect URL with --no-browser and the registered redirect', async () => {
-    await writeOAuthClient(client, authBaseUrl);
     const fetchImplementation = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(
@@ -592,19 +513,18 @@ describe('login', () => {
 
     expect(openBrowser).not.toHaveBeenCalled();
     expect(new URL(authorizationUrl).searchParams.get('redirect_uri')).toBe(
-      client.redirectUri
+      registeredRedirectUri
     );
     const exchange = Object.fromEntries(
       formBody(fetchImplementation.mock.calls[0])
     );
     expect(exchange).toMatchObject({
       code: 'pasted',
-      redirect_uri: client.redirectUri,
+      redirect_uri: registeredRedirectUri,
     });
   });
 
   it('accepts a bare pasted code without a state', async () => {
-    await writeOAuthClient(client, authBaseUrl);
     const fetchImplementation = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(
@@ -626,11 +546,10 @@ describe('login', () => {
 
   it('signs in over a corrupt credentials file and keeps a backup', async () => {
     vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
-    await writeOAuthClient(client, authBaseUrl);
+    await writeOAuthTokens(tokens, authBaseUrl);
     await writeFile(getCredentialsPath(), '{not json', 'utf8');
     const fetchImplementation = vi
       .fn<typeof fetch>()
-      .mockResolvedValueOnce(jsonResponse({ client_id: 'client-new' }, 201))
       .mockResolvedValueOnce(
         jsonResponse(tokenResponse('access-2', 'refresh-2'))
       );
@@ -648,7 +567,6 @@ describe('login', () => {
   });
 
   it('fails clearly when headless and no paste handler is provided', async () => {
-    await writeOAuthClient(client, authBaseUrl);
     await expect(
       login({
         authBaseUrl,
@@ -661,10 +579,6 @@ describe('login', () => {
 });
 
 describe('OAuth session operations', () => {
-  beforeEach(async () => {
-    await writeOAuthClient(client, authBaseUrl);
-  });
-
   it('reports expired login when refresh is rejected with invalid_grant', async () => {
     await writeOAuthTokens({ ...tokens, expiresAt: 0 }, authBaseUrl);
 
@@ -678,7 +592,7 @@ describe('OAuth session operations', () => {
     ).rejects.toThrow('Your login expired. Run `gt login` to sign in again');
   });
 
-  it('forgets the stored client when the server rejects it as invalid_client', async () => {
+  it('does not mistake a 401 invalid_client for an expired login', async () => {
     await writeOAuthTokens({ ...tokens, expiresAt: 0 }, authBaseUrl);
 
     await expect(
@@ -688,9 +602,10 @@ describe('OAuth session operations', () => {
           .fn<typeof fetch>()
           .mockResolvedValue(jsonResponse({ error: 'invalid_client' }, 401)),
       })
-    ).rejects.toThrow('Run `gt login` again');
-    expect(await readOAuthClient(authBaseUrl)).toBeUndefined();
-    expect(await readOAuthTokens(authBaseUrl)).toBeUndefined();
+    ).rejects.toThrow('does not recognize the gt CLI');
+    expect((await readOAuthTokens(authBaseUrl))?.refreshToken).toBe(
+      'refresh-1'
+    );
   });
 
   it('reports the HTTP status when refresh fails for another reason', async () => {
@@ -762,7 +677,7 @@ describe('OAuth session operations', () => {
     expect(
       Object.fromEntries(formBody(fetchImplementation.mock.calls[1]))
     ).toEqual({
-      client_id: client.clientId,
+      client_id: OAUTH_CLIENT_ID,
       grant_type: 'refresh_token',
       refresh_token: 'refresh-1',
     });
@@ -814,14 +729,13 @@ describe('OAuth session operations', () => {
     await logout({ authBaseUrl, fetch: fetchImplementation });
 
     expect(await readOAuthTokens(authBaseUrl)).toBeUndefined();
-    expect(await readOAuthClient(authBaseUrl)).toEqual(client);
     expect(fetchImplementation.mock.calls[0][0]).toBe(
       `${authBaseUrl}/oauth2/revoke`
     );
     expect(
       Object.fromEntries(formBody(fetchImplementation.mock.calls[0]))
     ).toEqual({
-      client_id: client.clientId,
+      client_id: OAUTH_CLIENT_ID,
       token: 'refresh-1',
       token_type_hint: 'refresh_token',
     });
@@ -847,6 +761,7 @@ describe('OAuth session operations', () => {
 
   it('signs out locally without revoking when the credentials file is corrupt', async () => {
     const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    await writeOAuthTokens(tokens, authBaseUrl);
     await writeFile(getCredentialsPath(), '{not json', 'utf8');
     const fetchImplementation = vi.fn<typeof fetch>();
 
