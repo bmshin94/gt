@@ -22,8 +22,10 @@ describe.sequential('fetchAuthenticated', () => {
 
   it('uses the current user token and refreshes once after a 401', async () => {
     const authorizationHeaders: Array<string | null> = [];
-    vi.mocked(fetchWithTimeout).mockImplementation(async (_input, init) => {
-      authorizationHeaders.push(new Headers(init.headers).get('Authorization'));
+    vi.mocked(fetchWithTimeout).mockImplementation(async (input, init) => {
+      authorizationHeaders.push(
+        new Request(input, init).headers.get('Authorization')
+      );
       return authorizationHeaders.length === 1
         ? new Response('unauthorized', { status: 401 })
         : new Response('{}', { status: 200 });

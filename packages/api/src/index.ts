@@ -7,7 +7,11 @@ export type {
 } from './wrappers/awaitJobs';
 export { DEFAULT_BATCH_SIZE, processBatches } from './wrappers/batch';
 export type { BatchOptions } from './wrappers/batch';
-export { API_VERSION, createApiClient } from './wrappers/client';
+export {
+  API_VERSION,
+  createApiClient,
+  createUserTokenFetch,
+} from './wrappers/client';
 export type {
   ApiClientConfig,
   ApiVersion,

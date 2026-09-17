@@ -23,7 +23,6 @@ import {
   login,
   logout,
   OAUTH_SCOPE,
-  OAUTH_SCOPES,
   parsePastedCallback,
   readOAuthClient,
   readOAuthTokens,
@@ -107,21 +106,7 @@ describe('OAuth credential storage', () => {
     expect(await readOAuthClient(authBaseUrl)).toEqual(client);
     expect(JSON.parse(await readFile(getCredentialsPath(), 'utf8'))).toEqual({
       version: 2,
-      servers: {
-        [authBaseUrl]: {
-          client: {
-            client_id: client.clientId,
-            redirect_uri: client.redirectUri,
-          },
-          tokens: {
-            access_token: tokens.accessToken,
-            expires_at: tokens.expiresAt,
-            refresh_token: tokens.refreshToken,
-            scope: tokens.scope,
-            token_type: tokens.tokenType,
-          },
-        },
-      },
+      servers: { [authBaseUrl]: { client, tokens } },
     });
     if (process.platform !== 'win32') {
       expect((await stat(getCredentialsPath())).mode & 0o777).toBe(0o600);
@@ -163,14 +148,14 @@ describe('OAuth credential storage', () => {
     expect(await readOAuthClient(authBaseUrl)).toEqual(client);
   });
 
-  it('reports malformed credential files instead of treating them as logged out', async () => {
+  it('sets a malformed file aside and reads as logged out', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
     await writeOAuthTokens(tokens, authBaseUrl);
     await writeFile(getCredentialsPath(), '{not json', 'utf8');
 
-    await expect(readOAuthTokens(authBaseUrl)).rejects.toThrow(
-      'Stored OAuth credentials are invalid'
-    );
-    expect(await corruptBackups()).toEqual([]);
+    expect(await readOAuthTokens(authBaseUrl)).toBeUndefined();
+    expect(await corruptBackups()).toHaveLength(1);
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 
   it('sets a malformed file aside when replacing credentials', async () => {
@@ -204,7 +189,8 @@ describe('OAuth credential storage', () => {
     expect(await corruptBackups()).toEqual([]);
   });
 
-  it('rejects the retired version 1 layout', async () => {
+  it('sets the retired version 1 layout aside', async () => {
+    vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
     await writeOAuthTokens(tokens, authBaseUrl);
     await writeFile(
       getCredentialsPath(),
@@ -212,9 +198,8 @@ describe('OAuth credential storage', () => {
       'utf8'
     );
 
-    await expect(readOAuthTokens(authBaseUrl)).rejects.toThrow(
-      'expected version 2'
-    );
+    expect(await readOAuthTokens(authBaseUrl)).toBeUndefined();
+    expect(await corruptBackups()).toHaveLength(1);
   });
 });
 
@@ -261,8 +246,8 @@ describe('PKCE and authorization URL', () => {
   });
 
   it('never requests API key management scopes', () => {
-    expect(OAUTH_SCOPES).not.toContain('project:api_keys:write');
-    expect(OAUTH_SCOPES).toContain('offline_access');
+    expect(OAUTH_SCOPE.split(' ')).not.toContain('project:api_keys:write');
+    expect(OAUTH_SCOPE.split(' ')).toContain('offline_access');
   });
 
   it('serializes the API resource as a URL href', () => {
@@ -870,7 +855,7 @@ describe('OAuth session operations', () => {
     expect(fetchImplementation).not.toHaveBeenCalled();
     expect(await readOAuthTokens(authBaseUrl)).toBeUndefined();
     expect(await corruptBackups()).toHaveLength(1);
-    expect(warn.mock.calls[0][0]).toContain('could not be revoked remotely');
+    expect(warn.mock.calls[0][0]).toContain('have been reset');
   });
 
   it('refreshes and returns userinfo for whoami', async () => {

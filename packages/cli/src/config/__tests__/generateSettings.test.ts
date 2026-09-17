@@ -386,14 +386,13 @@ describe('generateSettings - composite patterns', () => {
     );
   });
 
-  it('configures a lazy user token provider for both clients only when no explicit API key exists', async () => {
+  it('configures a lazy user token provider for both clients alongside any explicit API key', async () => {
     const userSettings = await generateSettings({}, '/test/cwd');
     const keySettings = await generateSettings(
       { apiKey: 'explicit-api-key' },
       '/test/cwd'
     );
 
-    expect(createUserTokenProvider).toHaveBeenCalledTimes(1);
     expect(userSettings.apiKey).toBeUndefined();
     expect(userSettings.userTokenProvider).toBe(
       vi.mocked(createUserTokenProvider).mock.results[0].value
@@ -410,10 +409,8 @@ describe('generateSettings - composite patterns', () => {
       userTokenProvider: userSettings.userTokenProvider,
     });
     expect(keySettings.apiKey).toBe('explicit-api-key');
-    expect(keySettings.userTokenProvider).toBeUndefined();
     expect(vi.mocked(configureApiClient).mock.calls[1][0]).toMatchObject({
       apiKey: 'explicit-api-key',
-      userTokenProvider: undefined,
     });
   });
 

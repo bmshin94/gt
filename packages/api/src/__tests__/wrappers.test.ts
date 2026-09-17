@@ -305,7 +305,7 @@ describe('createApiClient', () => {
       baseUrl: 'https://example.com',
       fetch: fetchMock,
       userTokenProvider: {
-        getAccessToken: () => 'user-access-token',
+        getAccessToken: async () => 'user-access-token',
         refreshAccessToken: vi.fn(),
       },
     });
@@ -393,7 +393,7 @@ describe('createApiClient', () => {
       fetch: fetchMock,
       retryPolicy: 'none',
       userTokenProvider: {
-        getAccessToken: () => 'expired-token',
+        getAccessToken: async () => 'expired-token',
         refreshAccessToken,
       },
     });

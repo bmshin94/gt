@@ -207,11 +207,9 @@ export async function generateSettings(
     (locale) => locale !== mergedOptions.defaultLocale
   );
 
-  // Explicit keys remain the highest-precedence credential for automation.
+  // The API client prefers apiKey when both are set; the provider is lazy.
   mergedOptions.apiKey = mergedOptions.apiKey || process.env.GT_API_KEY;
-  if (!mergedOptions.apiKey) {
-    mergedOptions.userTokenProvider = createUserTokenProvider();
-  }
+  mergedOptions.userTokenProvider = createUserTokenProvider();
 
   // Add projectId if not provided
   mergedOptions.projectId = mergedOptions.projectId || resolveProjectId();

@@ -11,7 +11,7 @@ export type ApiVersion = NonNullable<
 export const API_VERSION: ApiVersion = '2026-03-06.v1';
 
 export type UserTokenProvider = {
-  getAccessToken: () => Promise<string | undefined> | string | undefined;
+  getAccessToken: () => Promise<string>;
   refreshAccessToken: () => Promise<string | undefined>;
 };
 
@@ -27,7 +27,8 @@ export type ApiClientConfig = {
   userTokenProvider?: UserTokenProvider;
 };
 
-function createUserTokenFetch(
+/** Attaches the user's bearer token and retries once with a refreshed token after a 401. */
+export function createUserTokenFetch(
   fetchImplementation: typeof fetch,
   provider: UserTokenProvider
 ): typeof fetch {
@@ -35,10 +36,10 @@ function createUserTokenFetch(
     const request = new Request(input, init);
     if (request.headers.has('Authorization'))
       return fetchImplementation(request);
-    const accessToken = await provider.getAccessToken();
-    if (accessToken) {
-      request.headers.set('Authorization', `Bearer ${accessToken}`);
-    }
+    request.headers.set(
+      'Authorization',
+      `Bearer ${await provider.getAccessToken()}`
+    );
 
     const response = await fetchImplementation(request.clone());
     if (response.status !== 401) return response;

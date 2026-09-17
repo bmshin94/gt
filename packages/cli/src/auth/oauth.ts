@@ -26,19 +26,17 @@ export const OAUTH_CLIENT_NAME = 'General Translation CLI';
  * Scopes requested by `gt login`. The provider rejects unknown scopes, so each
  * entry must exist in gt-cloud's oauthProviderConfig. Permission scopes map to
  * the CLI commands that call operations requiring them:
+ * - openid, profile: identity/name/email for `gt whoami`
+ * - offline_access: refresh tokens so logins outlive the 1h access token
+ * - project:files:read: stage/download/status polling, project + branch + file info, orphaned files
+ * - project:files:write: upload sources/translations, branches, tags, publish, moves, user-edit diffs, fonts
+ * - project:translations:enqueue: translate/enqueue
+ * - project:translations:generate: runtime `POST /v2/translate` used by `gt api` and dev workflows
+ * - project:context:write: `gt setup`'s project context generation
+ * - org:projects:create: `gt project create`
  */
-export const OAUTH_SCOPES = [
-  'openid', // identity for `gt whoami`
-  'profile', // name/email for `gt whoami`
-  'offline_access', // refresh tokens so logins outlive the 1h access token
-  'project:files:read', // stage/download/status polling, project + branch + file info, orphaned files
-  'project:files:write', // upload sources/translations, branches, tags, publish, moves, user-edit diffs, fonts
-  'project:translations:enqueue', // translate/enqueue
-  'project:translations:generate', // runtime `POST /v2/translate` used by `gt api` and dev workflows
-  'project:context:write', // `gt setup`'s project context generation
-  'org:projects:create', // `gt project create`
-] as const;
-export const OAUTH_SCOPE = OAUTH_SCOPES.join(' ');
+export const OAUTH_SCOPE =
+  'openid profile offline_access project:files:read project:files:write project:translations:enqueue project:translations:generate project:context:write org:projects:create';
 
 /**
  * Registered once per authorization server; the provider matches loopback
@@ -63,22 +61,9 @@ export type OAuthClient = {
   redirectUri: string;
 };
 
-type StoredOAuthTokens = {
-  access_token: string;
-  expires_at: number;
-  refresh_token: string;
-  scope: string;
-  token_type: string;
-};
-
-type StoredOAuthClient = {
-  client_id: string;
-  redirect_uri: string;
-};
-
 type StoredServerCredentials = {
-  client?: StoredOAuthClient;
-  tokens?: StoredOAuthTokens;
+  client?: OAuthClient;
+  tokens?: OAuthTokens;
 };
 
 type StoredCredentials = {
@@ -265,13 +250,8 @@ export function getCredentialsPath(): string {
 // Credentials file
 // ---------------------------------------------------------------------------
 
-const CORRUPT_CREDENTIALS_RESET =
-  'Stored OAuth credentials were invalid and have been reset.';
-
-/** Fails closed unless `corruptWarning` is given, which sets an unreadable file aside instead. */
-async function readCredentialsFile(
-  corruptWarning?: string
-): Promise<StoredCredentials> {
+/** An unreadable file is set aside (not deleted) and treated as logged out. */
+async function readCredentialsFile(): Promise<StoredCredentials> {
   const credentialsPath = getCredentialsPath();
   let contents: string;
   try {
@@ -292,42 +272,14 @@ async function readCredentialsFile(
     ) {
       throw new Error('expected version 2 with a servers object');
     }
-    const servers: Record<string, StoredServerCredentials> = {};
-    for (const [authBaseUrl, entry] of Object.entries(parsed.servers)) {
-      if (!isRecord(entry)) throw new Error(`invalid entry for ${authBaseUrl}`);
-      const server: StoredServerCredentials = {};
-      if (isRecord(entry.client)) {
-        server.client = {
-          client_id: stringField(entry.client, 'client_id'),
-          redirect_uri: stringField(entry.client, 'redirect_uri'),
-        };
-      }
-      if (isRecord(entry.tokens)) {
-        server.tokens = {
-          access_token: stringField(entry.tokens, 'access_token'),
-          expires_at: numberField(entry.tokens, 'expires_at'),
-          refresh_token:
-            optionalStringField(entry.tokens, 'refresh_token') ?? '',
-          scope: stringField(entry.tokens, 'scope'),
-          token_type: stringField(entry.tokens, 'token_type'),
-        };
-      }
-      servers[authBaseUrl] = server;
-    }
-    return { version: 2, servers };
-  } catch (error) {
-    if (corruptWarning) {
-      const backupPath = `${credentialsPath}.corrupt-${Date.now()}`;
-      await rename(credentialsPath, backupPath);
-      logger.warn(
-        `${corruptWarning} The unreadable file was moved to ${backupPath}`
-      );
-      return { version: 2, servers: {} };
-    }
-    const detail = error instanceof Error ? error.message : 'unknown error';
-    throw new Error(`Stored OAuth credentials are invalid: ${detail}`, {
-      cause: error,
-    });
+    return parsed as StoredCredentials;
+  } catch {
+    const backupPath = `${credentialsPath}.corrupt-${Date.now()}`;
+    await rename(credentialsPath, backupPath);
+    logger.warn(
+      `Stored OAuth credentials were invalid and have been reset. The unreadable file was moved to ${backupPath}`
+    );
+    return { version: 2, servers: {} };
   }
 }
 
@@ -359,7 +311,7 @@ async function updateServerCredentials(
   authBaseUrl: string,
   update: (current: StoredServerCredentials) => StoredServerCredentials | null
 ): Promise<void> {
-  const credentials = await readCredentialsFile(CORRUPT_CREDENTIALS_RESET);
+  const credentials = await readCredentialsFile();
   const next = update(credentials.servers[authBaseUrl] ?? {});
   if (next === null || (!next.client && !next.tokens)) {
     delete credentials.servers[authBaseUrl];
@@ -376,15 +328,7 @@ async function updateServerCredentials(
 export async function readOAuthTokens(
   authBaseUrl = getAuthBaseUrl()
 ): Promise<OAuthTokens | undefined> {
-  const stored = (await readCredentialsFile()).servers[authBaseUrl]?.tokens;
-  if (!stored) return undefined;
-  return {
-    accessToken: stored.access_token,
-    expiresAt: stored.expires_at,
-    refreshToken: stored.refresh_token,
-    scope: stored.scope,
-    tokenType: stored.token_type,
-  };
+  return (await readCredentialsFile()).servers[authBaseUrl]?.tokens;
 }
 
 export async function writeOAuthTokens(
@@ -393,13 +337,7 @@ export async function writeOAuthTokens(
 ): Promise<void> {
   await updateServerCredentials(authBaseUrl, (current) => ({
     ...current,
-    tokens: {
-      access_token: tokens.accessToken,
-      expires_at: tokens.expiresAt,
-      refresh_token: tokens.refreshToken,
-      scope: tokens.scope,
-      token_type: tokens.tokenType,
-    },
+    tokens,
   }));
 }
 
@@ -415,9 +353,7 @@ export async function deleteOAuthTokens(
 export async function readOAuthClient(
   authBaseUrl = getAuthBaseUrl()
 ): Promise<OAuthClient | undefined> {
-  const stored = (await readCredentialsFile()).servers[authBaseUrl]?.client;
-  if (!stored) return undefined;
-  return { clientId: stored.client_id, redirectUri: stored.redirect_uri };
+  return (await readCredentialsFile()).servers[authBaseUrl]?.client;
 }
 
 export async function writeOAuthClient(
@@ -426,7 +362,7 @@ export async function writeOAuthClient(
 ): Promise<void> {
   await updateServerCredentials(authBaseUrl, (current) => ({
     ...current,
-    client: { client_id: client.clientId, redirect_uri: client.redirectUri },
+    client,
   }));
 }
 
@@ -483,11 +419,9 @@ export async function registerOAuthClient({
 async function getOrRegisterOAuthClient(
   options: OAuthRequestOptions
 ): Promise<OAuthClient> {
-  const stored = (await readCredentialsFile(CORRUPT_CREDENTIALS_RESET)).servers[
-    options.authBaseUrl ?? getAuthBaseUrl()
-  ]?.client;
-  if (!stored) return registerOAuthClient(options);
-  return { clientId: stored.client_id, redirectUri: stored.redirect_uri };
+  return (
+    (await readOAuthClient(options.authBaseUrl)) ?? registerOAuthClient(options)
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -619,14 +553,10 @@ async function authorize(
   const { codeVerifier, codeChallenge } = createPkcePair();
   const state = randomBytes(16).toString('base64url');
 
-  let loopback: Awaited<ReturnType<typeof startLoopbackServer>> | undefined;
-  if (!options.noBrowser) {
-    try {
-      loopback = await startLoopbackServer();
-    } catch {
-      // Fall through to the paste-the-code flow below.
-    }
-  }
+  // A failed bind falls through to the paste-the-code flow below.
+  const loopback = options.noBrowser
+    ? undefined
+    : await startLoopbackServer().catch(() => undefined);
   const redirectUri = loopback?.redirectUri ?? client.redirectUri;
 
   let code: string;
@@ -769,23 +699,18 @@ export async function logout({
   authBaseUrl = getAuthBaseUrl(),
   fetch: fetchImplementation = globalThis.fetch,
 }: OAuthRequestOptions = {}): Promise<void> {
-  const stored = (
-    await readCredentialsFile(
-      'Stored OAuth credentials were invalid, so the session could not be revoked remotely.'
-    )
-  ).servers[authBaseUrl];
-  const tokens = stored?.tokens;
-  const client = stored?.client;
+  const tokens = await readOAuthTokens(authBaseUrl);
+  const client = await readOAuthClient(authBaseUrl);
   try {
-    if (tokens?.refresh_token && client) {
+    if (tokens?.refreshToken && client) {
       const response = await fetchImplementation(
         `${authBaseUrl}/oauth2/revoke`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body: new URLSearchParams({
-            client_id: client.client_id,
-            token: tokens.refresh_token,
+            client_id: client.clientId,
+            token: tokens.refreshToken,
             token_type_hint: 'refresh_token',
           }),
         }

@@ -229,10 +229,9 @@ export async function handleApiCommand(
   const config = configPath
     ? loadConfig(configPath)
     : (resolveConfig(process.cwd())?.config ?? {});
-  const apiKey = options.apiKey ?? process.env.GT_API_KEY;
   const client = createApiClient({
-    apiKey,
-    userTokenProvider: apiKey ? undefined : createUserTokenProvider(),
+    apiKey: options.apiKey ?? process.env.GT_API_KEY,
+    userTokenProvider: createUserTokenProvider(),
     baseUrl:
       typeof config.baseUrl === 'string' ? config.baseUrl : defaultBaseUrl,
     fetch: dependencies.fetch,
