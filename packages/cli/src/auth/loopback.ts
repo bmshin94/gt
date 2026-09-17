@@ -1,4 +1,5 @@
 import { createServer, type Server } from 'node:http';
+import { renderCallbackPage } from './callbackPage.js';
 
 export const LOOPBACK_CALLBACK_PATH = '/callback';
 const DEFAULT_CALLBACK_TIMEOUT_MS = 5 * 60 * 1000;
@@ -86,15 +87,12 @@ export async function startLoopbackServer(): Promise<LoopbackServer> {
           const succeeded = Boolean(callback.code) && !callback.error;
           response.writeHead(succeeded ? 200 : 400, {
             'cache-control': 'no-store',
-            'content-security-policy': "default-src 'none'",
+            'content-security-policy':
+              "default-src 'none'; style-src 'unsafe-inline'",
             'content-type': 'text/html; charset=utf-8',
             'x-content-type-options': 'nosniff',
           });
-          response.end(
-            succeeded
-              ? '<!doctype html><title>Signed in</title><p>You are signed in to the General Translation CLI. You can close this tab and return to your terminal.</p>'
-              : '<!doctype html><title>Sign in failed</title><p>Sign in did not complete. Return to your terminal for details.</p>'
-          );
+          response.end(renderCallbackPage(succeeded));
           server.close();
           resolve(callback);
         });
