@@ -257,9 +257,8 @@ describe('PKCE and authorization URL', () => {
     });
   });
 
-  it('never requests API key management scopes', () => {
-    expect(OAUTH_SCOPE.split(' ')).not.toContain('project:api_keys:write');
-    expect(OAUTH_SCOPE.split(' ')).toContain('offline_access');
+  it('requests the gt-cli client scopes: identity, refresh, and `gt:*`', () => {
+    expect(OAUTH_SCOPE).toBe('openid profile offline_access gt:*');
   });
 
   it('serializes the API resource as a URL href', () => {

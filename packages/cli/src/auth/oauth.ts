@@ -24,20 +24,16 @@ import { startLoopbackServer, type AuthorizationCallback } from './loopback.js';
 export const OAUTH_CLIENT_ID = 'gt-cli';
 
 /**
- * Scopes requested by `gt login`. The provider rejects unknown scopes, so each
- * entry must exist in gt-cloud's oauthProviderConfig. Permission scopes map to
- * the CLI commands that call operations requiring them:
+ * Scopes requested by `gt login`, sent on both grants. Must match the scopes
+ * registered on gt-cloud's `gt-cli` client row or the provider returns
+ * `invalid_scope`. Sent explicitly because @better-auth/oauth-provider's
+ * device-authorization endpoint does not fill a missing scope from the client
+ * row (the authorize endpoint does).
  * - openid, profile: identity/name/email for `gt whoami`
  * - offline_access: refresh tokens so logins outlive the 1h access token
- * - project:files:read: stage/download/status polling, project + branch + file info, orphaned files
- * - project:files:write: upload sources/translations, branches, tags, publish, moves, user-edit diffs, fonts
- * - project:translations:enqueue: translate/enqueue
- * - project:translations:generate: runtime `POST /v2/translate` used by `gt api` and dev workflows
- * - project:context:write: `gt setup`'s project context generation
- * - org:projects:create: `gt project create`
+ * - `gt:*`: same access as the user's dashboard membership, resolved server-side
  */
-export const OAUTH_SCOPE =
-  'openid profile offline_access project:files:read project:files:write project:translations:enqueue project:translations:generate project:context:write org:projects:create';
+export const OAUTH_SCOPE = 'openid profile offline_access gt:*';
 
 // RFC 8628 §3.5: add 5 seconds to the polling interval on `slow_down`.
 const SLOW_DOWN_INCREMENT_SECONDS = 5;
