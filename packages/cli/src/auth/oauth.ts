@@ -39,7 +39,6 @@ export const OAUTH_CLIENT_ID = 'gt-cli';
 export const OAUTH_SCOPE =
   'openid profile offline_access project:files:read project:files:write project:translations:enqueue project:translations:generate project:context:write org:projects:create';
 
-const DEVICE_CODE_GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:device_code';
 // RFC 8628 §3.5: add 5 seconds to the polling interval on `slow_down`.
 const SLOW_DOWN_INCREMENT_SECONDS = 5;
 // Distinct from defaultTimeout on purpose: refresh slightly before expiry so
@@ -54,14 +53,10 @@ export type OAuthTokens = {
   tokenType: string;
 };
 
-type StoredServerCredentials = {
-  tokens?: OAuthTokens;
-};
-
 type StoredCredentials = {
   version: 2;
   /** Keyed by authorization server base URL so dev and prod logins coexist. */
-  servers: Record<string, StoredServerCredentials>;
+  servers: Record<string, OAuthTokens>;
 };
 
 export type DeviceCode = {
@@ -297,16 +292,15 @@ async function writeCredentialsFile(
   }
 }
 
-async function updateServerCredentials(
+async function setServerTokens(
   authBaseUrl: string,
-  update: (current: StoredServerCredentials) => StoredServerCredentials | null
+  tokens: OAuthTokens | undefined
 ): Promise<void> {
   const credentials = await readCredentialsFile();
-  const next = update(credentials.servers[authBaseUrl] ?? {});
-  if (next === null || !next.tokens) {
-    delete credentials.servers[authBaseUrl];
+  if (tokens) {
+    credentials.servers[authBaseUrl] = tokens;
   } else {
-    credentials.servers[authBaseUrl] = next;
+    delete credentials.servers[authBaseUrl];
   }
   if (Object.keys(credentials.servers).length === 0) {
     await rm(getCredentialsPath(), { force: true });
@@ -318,23 +312,20 @@ async function updateServerCredentials(
 export async function readOAuthTokens(
   authBaseUrl = getAuthBaseUrl()
 ): Promise<OAuthTokens | undefined> {
-  return (await readCredentialsFile()).servers[authBaseUrl]?.tokens;
+  return (await readCredentialsFile()).servers[authBaseUrl];
 }
 
 export async function writeOAuthTokens(
   tokens: OAuthTokens,
   authBaseUrl = getAuthBaseUrl()
 ): Promise<void> {
-  await updateServerCredentials(authBaseUrl, (current) => ({
-    ...current,
-    tokens,
-  }));
+  await setServerTokens(authBaseUrl, tokens);
 }
 
 export async function deleteOAuthTokens(
   authBaseUrl = getAuthBaseUrl()
 ): Promise<void> {
-  await updateServerCredentials(authBaseUrl, () => null);
+  await setServerTokens(authBaseUrl, undefined);
 }
 
 // ---------------------------------------------------------------------------
@@ -358,14 +349,12 @@ export function createPkcePair(
 
 export function buildAuthorizationUrl({
   authBaseUrl,
-  clientId,
   redirectUri,
   codeChallenge,
   state,
   apiResource,
 }: {
   authBaseUrl: string;
-  clientId: string;
   redirectUri: string;
   codeChallenge: string;
   state: string;
@@ -374,7 +363,7 @@ export function buildAuthorizationUrl({
   const url = new URL(`${authBaseUrl}/oauth2/authorize`);
   url.search = new URLSearchParams({
     response_type: 'code',
-    client_id: clientId,
+    client_id: OAUTH_CLIENT_ID,
     redirect_uri: redirectUri,
     scope: OAUTH_SCOPE,
     state,
@@ -388,13 +377,11 @@ export function buildAuthorizationUrl({
 export async function exchangeAuthorizationCode({
   authBaseUrl = getAuthBaseUrl(),
   fetch: fetchImplementation = globalThis.fetch,
-  clientId,
   code,
   codeVerifier,
   redirectUri,
   apiResource,
 }: OAuthRequestOptions & {
-  clientId: string;
   code: string;
   codeVerifier: string;
   redirectUri: string;
@@ -405,7 +392,7 @@ export async function exchangeAuthorizationCode({
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       grant_type: 'authorization_code',
-      client_id: clientId,
+      client_id: OAUTH_CLIENT_ID,
       code,
       code_verifier: codeVerifier,
       redirect_uri: redirectUri,
@@ -505,7 +492,7 @@ export async function pollDeviceToken({
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({
-          grant_type: DEVICE_CODE_GRANT_TYPE,
+          grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
           client_id: OAUTH_CLIENT_ID,
           device_code: deviceCode.deviceCode,
           resource: apiResource,
@@ -581,20 +568,10 @@ async function loginWithDeviceCode(
 export async function login(options: LoginOptions = {}): Promise<OAuthTokens> {
   const authBaseUrl = options.authBaseUrl ?? getAuthBaseUrl();
   const apiResource = options.apiResource ?? getApiResource();
-  if (options.noBrowser) {
-    if (!options.onDeviceCode) {
-      throw new Error(
-        'Sign in with --no-browser needs an onDeviceCode handler to show the user code'
-      );
-    }
-    return loginWithDeviceCode(options, authBaseUrl, apiResource);
-  }
-  let loopback: Awaited<ReturnType<typeof startLoopbackServer>>;
-  try {
-    loopback = await startLoopbackServer();
-  } catch {
-    return loginWithDeviceCode(options, authBaseUrl, apiResource);
-  }
+  const loopback = options.noBrowser
+    ? undefined
+    : await startLoopbackServer().catch(() => undefined);
+  if (!loopback) return loginWithDeviceCode(options, authBaseUrl, apiResource);
 
   const { codeVerifier, codeChallenge } = createPkcePair();
   const state = randomBytes(16).toString('base64url');
@@ -605,7 +582,6 @@ export async function login(options: LoginOptions = {}): Promise<OAuthTokens> {
     callback.catch(() => undefined);
     const authorizationUrl = buildAuthorizationUrl({
       authBaseUrl,
-      clientId: OAUTH_CLIENT_ID,
       redirectUri: loopback.redirectUri,
       codeChallenge,
       state,
@@ -623,7 +599,6 @@ export async function login(options: LoginOptions = {}): Promise<OAuthTokens> {
   const tokens = await exchangeAuthorizationCode({
     authBaseUrl,
     fetch: options.fetch,
-    clientId: OAUTH_CLIENT_ID,
     code,
     codeVerifier,
     redirectUri: loopback.redirectUri,

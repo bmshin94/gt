@@ -118,7 +118,7 @@ describe('OAuth credential storage', () => {
     expect(await readOAuthTokens(authBaseUrl)).toEqual(tokens);
     expect(JSON.parse(await readFile(getCredentialsPath(), 'utf8'))).toEqual({
       version: 2,
-      servers: { [authBaseUrl]: { tokens } },
+      servers: { [authBaseUrl]: tokens },
     });
     if (process.platform !== 'win32') {
       expect((await stat(getCredentialsPath())).mode & 0o777).toBe(0o600);
@@ -159,18 +159,6 @@ describe('OAuth credential storage', () => {
     await expect(stat(getCredentialsPath())).rejects.toMatchObject({
       code: 'ENOENT',
     });
-  });
-
-  it('ignores the client registration older files stored', async () => {
-    await writeOAuthTokens(tokens, authBaseUrl);
-    const stored = JSON.parse(await readFile(getCredentialsPath(), 'utf8'));
-    stored.servers[authBaseUrl].client = {
-      client_id: 'client-1',
-      redirect_uri: 'http://127.0.0.1/callback',
-    };
-    await writeFile(getCredentialsPath(), JSON.stringify(stored), 'utf8');
-
-    expect(await readOAuthTokens(authBaseUrl)).toEqual(tokens);
   });
 
   it('sets a malformed file aside and reads as logged out', async () => {
@@ -249,7 +237,6 @@ describe('PKCE and authorization URL', () => {
     const url = new URL(
       buildAuthorizationUrl({
         authBaseUrl,
-        clientId: 'client-1',
         redirectUri: 'http://127.0.0.1:4242/callback',
         codeChallenge: 'challenge',
         state: 'state-1',
@@ -260,7 +247,7 @@ describe('PKCE and authorization URL', () => {
     expect(url.origin + url.pathname).toBe(`${authBaseUrl}/oauth2/authorize`);
     expect(Object.fromEntries(url.searchParams)).toEqual({
       response_type: 'code',
-      client_id: 'client-1',
+      client_id: OAUTH_CLIENT_ID,
       redirect_uri: 'http://127.0.0.1:4242/callback',
       scope: OAUTH_SCOPE,
       state: 'state-1',
@@ -290,7 +277,6 @@ describe('authorization code exchange', () => {
     const result = await exchangeAuthorizationCode({
       authBaseUrl,
       fetch: fetchImplementation,
-      clientId: 'client-1',
       code: 'code-1',
       codeVerifier: 'verifier-1',
       redirectUri: 'http://127.0.0.1:4242/callback',
@@ -305,7 +291,7 @@ describe('authorization code exchange', () => {
       Object.fromEntries(formBody(fetchImplementation.mock.calls[0]))
     ).toEqual({
       grant_type: 'authorization_code',
-      client_id: 'client-1',
+      client_id: OAUTH_CLIENT_ID,
       code: 'code-1',
       code_verifier: 'verifier-1',
       redirect_uri: 'http://127.0.0.1:4242/callback',
@@ -321,7 +307,6 @@ describe('authorization code exchange', () => {
     const result = await exchangeAuthorizationCode({
       authBaseUrl,
       fetch: vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(response)),
-      clientId: 'client-1',
       code: 'code-1',
       codeVerifier: 'verifier-1',
       redirectUri: 'http://127.0.0.1:4242/callback',
@@ -344,7 +329,6 @@ describe('authorization code exchange', () => {
         fetch: vi
           .fn<typeof fetch>()
           .mockResolvedValue(jsonResponse({ error: 'invalid_grant' }, 400)),
-        clientId: 'client-1',
         code: 'code-1',
         codeVerifier: 'verifier-1',
         redirectUri: 'http://127.0.0.1:4242/callback',
@@ -571,20 +555,6 @@ describe('login', () => {
     expect(openBrowser).toHaveBeenCalledWith(
       deviceCode.verificationUriComplete
     );
-  });
-
-  it('rejects --no-browser without an onDeviceCode handler before requesting a code', async () => {
-    const fetchImplementation = vi.fn<typeof fetch>();
-
-    await expect(
-      login({
-        authBaseUrl,
-        apiResource,
-        fetch: fetchImplementation,
-        noBrowser: true,
-      })
-    ).rejects.toThrow('needs an onDeviceCode handler');
-    expect(fetchImplementation).not.toHaveBeenCalled();
   });
 
   it('signs in over a corrupt credentials file and keeps a backup', async () => {
